@@ -1,88 +1,74 @@
 # Merge Bot Development Status
 
-## Current State: 3-WINDOW MULTI-WINDOW TEST PASSED ✅✅✅
+## Current State: RANDOM WALK SIMULATION IMPLEMENTED ✅ (Reality Check)
 - Code compiles cleanly (0 errors, 0 warnings)
 - Unit tests pass
-- Dry-run mode end-to-end tested across 3 consecutive 5-min windows
-- **3-Window Test: 42 merges, 1560 pairs, +$138.73 profit, 92.9% win rate**
-- Window transitions, capital carry-forward, position resets all working
+- Simulation upgraded from deterministic sine-wave to GBM random walk
+- **First realistic dry-run: merges are profitable but unmerged position risk dominates**
 
-## Latest Test — 3-Window Multi-Window (2026-02-16 ~04:09 UTC)
+## Latest Test — Random Walk Dry-Run (2026-02-16 ~04:28 UTC)
 ### Test Parameters
-- `--max-windows 3 --log-level info --entry-delay 5 --exit-buffer 5`
-- Simulated BTC feed, simulated order books
+- `--max-windows 2 --log-level info --entry-delay 5 --exit-buffer 5`
+- **NEW**: GBM random walk BTC feed (not deterministic sine)
+- **NEW**: Noisy order book spreads (±0.5c jitter, time-dependent widening)
 - Capital: $215, Target edge: 2%
 
 ### Per-Window Results
 ```
-Window  Merges  Pairs   Profit    Win Rate
-──────  ──────  ──────  ────────  ────────
-  #1      15     500    +$61.12   14/15 (93%)
-  #2      19     760    +$57.71   18/19 (95%)
-  #3       8     300    +$19.89    7/8  (88%)
-──────  ──────  ──────  ────────  ────────
-TOTAL     42    1560   +$138.73   39/42 (93%)
+Window  Merges  Pairs   Invested    Merge P&L   Win Rate    NET P&L
+──────  ──────  ──────  ──────────  ─────────   ────────    ────────
+  #1      12     380    $361.82     +$18.18     11/12       -$5.18 *
+  #2       7     360    $335.65     +$24.35      7/7        (killed)
+──────  ──────  ──────  ──────────  ─────────   ────────    ────────
+TOTAL     19     740    $697.47     +$42.53     18/19       ~-$5
+```
+* Window 1 NET loss due to 60 unmerged Down shares ($23.36 lost)
+* Window 2 was killed by timeout before summary — merges looked profitable
+
+### Key Insights from Random Walk
+1. **Merges ARE profitable**: 18/19 winning (95%), avg profit $2.24/merge
+2. **Unmerged positions are the MAIN RISK**: BTC trending one way builds up one-sided shares
+3. **Window 1 example**: BTC trended down → 60 Down shares accumulated → $23.36 lost at close
+4. **Merge margins realistic**: 0.7% to 16.5% per merge (vs 2-14% with sine wave)
+5. **Capital turnover lower**: 3.2x (vs 6.8x with sine) — fewer oscillations to exploit
+
+### Comparison: Random Walk vs Old Sine Wave
+```
+Metric              Sine Wave (3-win)   Random Walk (this test)
+────────────────    ─────────────────   ───────────────────────
+Merges/window       ~14                 ~10
+Pairs/window        ~520                ~370
+Merge profit/win    ~$46                ~$21
+Capital turnover    6.8x                3.2x
+Win rate            93%                 95%
+Unmerged risk       LOW                 HIGH ⚠️
+NET profit/win      ~$30                ~-$3 (variable)
 ```
 
-### Session Summary
-```
-Total orders placed:   162
-Total merges:          42
-Total pairs merged:    1560
-Total invested:        $1,468.99 (6.8x capital turnover)
-Total merge payout:    $1,560.00
-Merge profit:          $138.73
-NET P&L:               $100.50 (after unmerged losses)
-Win rate:              92.9% (39/42)
-Final capital:         $306.01 (from $215 start, +42.3%)
-Avg merge profit:      $3.30 (9.76% margin)
-```
-
-### Key Observations
-- Window transitions work cleanly — positions reset, capital carries forward
-- Capital recycled through merges allows >$1400 invested from $215 base
-- Window 3 was less active (8 merges) — likely timing/cycle effect
-- 3 losing merges total (max: -$2.49 on one merge, -11% on 20 pairs)
-- Unmerged positions: 20 Up shares after W1, 20 Down after W2 close
-- Position balance limit (3x ratio) continues to prevent heavy one-sided exposure
-
-## Previous Tests
-| Run | Merges | Pairs | Profit | Win Rate | Notes |
-|-----|--------|-------|--------|----------|-------|
-| 3-win | 42 | 1560 | $138.73 | 92.9% | **Multi-window milestone** |
-| #4 | 29 | 1200 | $147.44 net | 96.5% | Capital turnover ~5.6x |
-| #3 | 3 | 140 | $19.23 | 100% | Clean close |
-| #2 | 17 | 560 | $79.63 | 82% | 3 losing merges |
-| #1 | 1 | 40 | $4.42 | 100% | First successful dry-run |
+## Previous Test History
+| Run | Sim Type | Merges | Pairs | Merge P&L | Win Rate | NET P&L | Notes |
+|-----|----------|--------|-------|-----------|----------|---------|-------|
+| Random Walk | GBM | 19 | 740 | +$42.53 | 95% | ~-$5 | **Reality check** |
+| 3-win sine | Sine | 42 | 1560 | +$138.73 | 93% | +$91 | Multi-window milestone |
+| #4 sine | Sine | 29 | 1200 | +$147.44 | 96.5% | +$147 | Capital turnover ~5.6x |
 
 ## All 10 Bugs Fixed ✅
-1. RwLock Deadlock — scoped read guard to drop before write
-2. should_buy() too restrictive — replaced market_ask check with bid-only
-3. Opening price mismatch — fixed with set_opening_price() per window
-4. Tight strategy loop — added unconditional sleep(order_interval)
-5. Window startup timing — wait for fresh window if < 64s remaining
-6. Market exposure release on merge — fixed accumulation blocking orders
-7. Position imbalance limit — prevents one-sided accumulation (3x ratio max)
-8. Cancelled order exposure release — releases risk budget at window close
-9. Conservative bid floor (0.40) — prevents overpaying during extreme swings
-10. NET P&L reporting — includes unmerged share losses in window summary
+(Same as before — see git history)
 
-## Known Limitations & Next Steps
-1. **Simulation is unrealistic** — BTC sine-wave oscillation + predictable order book
-   - Real markets: random walk + noise + competition + wider spreads
-   - Real-world profit will be significantly lower
-2. **Next: Make simulation realistic** — random walk BTC, stochastic books
-3. **Next: Live mode setup** — Polymarket API keys, Polygon wallet
-4. **Next: Live test with tiny capital** — $20-50 to validate in real conditions
-5. **Consider**: reduce max_side_price from 0.65 to 0.58 for extra safety
-6. **Consider**: per-window file logging (`--log-dir` flag)
+## Known Issues & Next Steps (Priority Order)
+1. **⚠️ CRITICAL: Unmerged position risk** — main source of loss
+   - Options: tighter imbalance limit (2x instead of 3x)
+   - Time-weighted position wind-down in last 60s
+   - Smaller order sizes (10 shares instead of 20) for finer control
+   - Emergency exit: sell unmerged positions before window close
+2. **Variance is HIGH** with random walks — need 10+ window sample
+3. **Consider**: Entry delay > 5s to let price establish direction
+4. **Consider**: Only buy when BTC is within ±0.1% of opening (tight range strategy)
+5. **Live mode setup** — Polymarket API keys, Polygon wallet
+6. **Live test** with tiny capital ($20-50) — real market conditions
 
 ## Architecture Notes
-- Simulated BTC feed oscillates ±$50-100 around $97,000 (deterministic sine waves)
-- Simulated order books derive from Black-Scholes fair value with 2.5c spread
-- Strategy waits 5s entry delay, stops 5s before window close
-- Orders: 20 shares per order, limit BUY at fair value
-- Target edge: 2% per merge pair (combined cost < $0.98)
-- Conservative bid: assumes other side costs ≥ $0.40 when no position held
-- Position balance: pauses buying if one side > 3x the other (and > 40 shares)
-- Max exposure: $100 per market window
+- Simulated BTC feed: GBM with 45% annualized vol + weak mean-reversion (κ=0.001)
+- Microstructure noise: ±$2-3 per tick
+- Order books: 3-level depth with ±0.5c spread jitter, widening near expiry
+- Strategy: 20 shares/order, 2% target edge, 3x imbalance ratio max
