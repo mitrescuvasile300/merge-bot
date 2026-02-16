@@ -1,64 +1,64 @@
 # Merge Bot Development Status
 
-## Current State: v9.1 (v12 HEAD) — FIRST PROFITABLE GBM RUN
+## Current State: v12 — VARIANCE CRUSHED, EV SLIGHTLY NEGATIVE
 - Code compiles cleanly (0 errors, 0 warnings)
+- v12: mid-window stop-loss + tighter FV bands + fill_price + 1 order/side max
 - HEAD: `e517b30` (v12: mid-window stop-loss + tighter FV bands + fill_price tracking)
-- **Milestone: +1.3% ROI on 3-window GBM random walk test**
-- Adverse selection problem identified and fixed
+- **Key finding: Variance reduced from ±$40 to ±$1.3/window, but average is -$0.91/window**
 
-## Latest Tests — 2026-02-16 ~07:08-07:20 UTC
+## Latest Test — 2026-02-16 ~07:16-07:30 UTC (v12, 3-window GBM)
 
-### Test: 3-Window GBM Random Walk (v9.1)
 ```
-Window  Merges  Margin    Salvage         NET P&L
-  #1      0     —        +$2.51 profit   +$2.51
-  #2     10     5.88%    -$0.95 loss     -$2.91
-  #3     15     5.8-9.7% +$2.29 profit   +$4.30
-──────  ──────  ────────  ──────────      ────────
-TOTAL    25     100% win  salvage +$3.85  +$2.70
-```
-- Capital: $215 → $217.70 (+1.26% ROI)
-- 17 orders, 4 merges, 25 pairs, 100% merge win rate
-- Stop-loss fired in W2: sold 10 excess DOWN at FV=0.14
+Window  Orders  Merges  Pairs  Merge P&L   Salvage Loss   NET P&L
+  #1      13      1       5    +$0.47      -$1.51         -$1.04
+  #2      11      4      20    +$1.89      -$3.39         -$1.50
+  #3      12      6      30    +$2.62      -$3.88         -$1.27
+─────   ─────   ────   ────   ────────    ──────────     ────────
+TOTAL    36      11      55    +$4.97      -$8.78         -$3.81
 
-### Comparison with v8
-```
-v8 (before):  5 windows → $193.86 (-9.8%) ❌
-v9.1 (now):   3 windows → $217.70 (+1.3%) ✅
+Capital: $215 → $212.26 (-1.27%)
+100% merge win rate | 4 mid-window stop-losses triggered
 ```
 
-## Root Cause: Adverse Selection (FIXED)
-The bot was buying MORE losing-side tokens because:
-1. Losing side gets cheaper → fills more at our limit price
-2. Winning side gets expensive → our limit doesn't fill
-3. Result: excess worthless losing tokens at expiry
+### What v12 Changed
+1. Two-tier mid-window stop-loss: HARD (FV<0.30 → sell immediately), SOFT (FV<0.40 → sell near close)
+2. Fill_price tracking (actual fill with price improvement, not limit price)
+3. Reduced max open orders per side: 2 → 1 (max 5 shares outstanding)
+4. Tightened FV extreme threshold: 0.20-0.80 (was 0.12-0.88)
 
-Three fixes:
-1. **Per-side order cap** (max 2 open/side) — prevents batch one-sided fills
-2. **Price improvement in sim** — fills at best_ask, not limit price
-3. **Mid-window stop-loss** — sells excess losing tokens at ~$0.12-0.18 vs $0.01 at expiry
+### Economics Breakdown
+- **Merge profit per window**: ~$1.66 avg (11 merges, 55 pairs, $0.09/pair avg)
+- **Salvage loss per window**: ~$2.93 avg (125 shares total, avg ~$0.07 loss/share)
+- **Net per window**: -$0.91 avg → slightly negative EV
+- **Merge efficiency**: 55 merged / ~180 total shares = 31% (need ~50%+ for break-even)
 
-## Architecture (v9.1)
-- **Sim**: GBM with 45% annual vol, κ=0.001 mean-reversion
-- **Orders**: 5 shares/order, max 2 open orders per side, max 10 imbalance
-- **Exposure**: $50/window cap (halved from $100)
-- **Salvage**: Sells excess at bid before window close
-- **Stop-loss**: If excess side FV < 0.20, sell early at current bid
-- **FV threshold**: 0.12-0.26 (time-scaled), stops buying clear losers
-- **P&L**: fill_price-based (with price improvement)
-- **Merge margin**: 5-10% per pair (improved from fixed 4.16% due to price improvement)
+### Root Cause: Adverse Selection
+When BTC trends, the losing side becomes cheap → more fills at our limit.
+The winning side's ask rises → no fills. We accumulate excess losing-side tokens
+that must be salvaged at a loss. The merge alpha is REAL (~9% per pair) but
+the position waste ratio makes it net negative.
 
 ## Test Results History
-| Run | Sim | Merges | Pairs | Merge P&L | Salvage Net | TRUE NET | Notes |
-|-----|-----|--------|-------|-----------|-------------|----------|-------|
-| v9.1 3-win GBM | GBM | 4 | 25 | +$1.62 | +$3.85 | +$2.70 | **PROFITABLE** |
-| v8 5-win GBM | GBM | 8 | 175 | +$7.00 | -$28.14 | -$21.14 | Adverse selection |
-| v8 3-win GBM | GBM | 5 | 170 | +$6.80 | +$58.21 | +$65.01 | Lucky salvage |
-| v8 1-win GBM | GBM | 2 | 110 | +$4.40 | -$42.30 | -$37.90 | Unlucky trend |
-| Sine wave 3-win | Sine | 42 | 1560 | +$138.73 | N/A | +$91 | Unrealistic |
+| Run | Version | Merges | Pairs | Merge P&L | Salvage Net | TRUE NET | Variance |
+|-----|---------|--------|-------|-----------|-------------|----------|----------|
+| v12 3-win GBM | v12 | 11 | 55 | +$4.97 | -$8.78 | -$3.81 | ±$0.25/win |
+| v9.1 3-win GBM | v9.1 | ? | 25 | ? | ? | +$2.70 | ±$3/win |
+| v8 3-win GBM | v8 | 5 | 170 | +$6.80 | +$58.21 | +$65.01 | ±$40/win |
+| v8 1-win GBM | v8 | 2 | 110 | +$4.40 | -$42.30 | -$37.90 | N/A |
+| v8 3-win sine | Sine | 42 | 1560 | +$138.73 | N/A | +$91 | N/A |
+| v8 1-win sine | Sine | 29 | 1200 | +$147.44 | N/A | +$147 | N/A |
+
+## Architecture
+- **Sim**: GBM with 45% annual vol, κ=0.001 mean-reversion
+- **Orders**: 5 shares/order, max 1 open per side, $0.48 max side price
+- **Stop-loss**: Two-tier (HARD at FV<0.30, SOFT at FV<0.40 near close)
+- **Salvage**: Sells excess unmerged at bid before window close
+- **FV threshold**: Time-scaled (20-80% early → 34-66% near expiry)
+- **P&L**: merge_profit + salvage_proceeds - salvage_cost - remaining_cost
 
 ## Next Steps (Priority)
-1. **🔴 Run 10+ window Monte Carlo** for statistical confidence on positive EV
-2. **🟡 Tune FV threshold** — current 0.12-0.26 may be too restrictive (0 merges in some windows)
-3. **🟢 Calibrate sim** with real Polymarket order books
-4. **🟢 Live test** — only after 20+ window stats confirm positive EV
+1. **🔴 Balanced buying constraint**: Only buy side B when holding side A → higher merge efficiency
+2. **🟡 Earlier stop-loss**: FV<0.40 trigger (currently 0.30) → better salvage recovery
+3. **🟡 Wider merge target**: $0.96 combined cost (not $0.98) → bigger per-pair edge
+4. **🟡 Python v9 exit-sell strategy**: Shows more consistent profit, different economics
+5. **🟢 Live test**: Only after merge efficiency > 50% or alternative strategy validated
