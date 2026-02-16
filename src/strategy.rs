@@ -852,14 +852,15 @@ impl MergeStrategy {
         // Early in window: allow buying at extreme FV (time for BTC reversal).
         // Late in window: stricter to avoid stranded positions.
         // Window is 300s. time_fraction = remaining / 300.
-        // At full time: allow FV 0.20-0.80 (tightened from 0.05-0.95 to reduce adverse selection)
-        // At mid time:  allow FV ~0.25-0.75
-        // At end (60s):  allow FV ~0.30-0.70 (conservative)
-        // Key insight: tokens with FV < 0.25 are likely losers — buying them creates
-        // unmerged waste that expires worthless. Better to skip and wait for reversal.
+        // At full time: allow FV 0.12-0.88 (moderate: avoids clear losers but allows activity)
+        // At mid time:  allow FV ~0.18-0.82
+        // At end (60s):  allow FV ~0.24-0.76 (conservative near expiry)
+        // Key insight: tokens with FV < 0.15 are almost certainly losers — buying them
+        // creates unmerged waste. But being TOO restrictive (0.20+) kills merge activity
+        // because windows 2+ see trending BTC that pushes FV outside the band.
         {
             let time_fraction = (snapshot.remaining_secs as f64 / 300.0).clamp(0.0, 1.0);
-            let min_fv_f64 = 0.20 + 0.12 * (1.0 - time_fraction);
+            let min_fv_f64 = 0.12 + 0.14 * (1.0 - time_fraction);
             let max_fv_f64 = 1.0 - min_fv_f64;
             let min_fv = Decimal::from_f64_retain(min_fv_f64)
                 .unwrap_or(dec!(0.15))

@@ -133,6 +133,8 @@ pub struct Order {
     pub token_id: String,
     pub side: Side,
     pub price: Decimal,
+    /// Actual execution price (may be better than limit price due to price improvement)
+    pub fill_price: Decimal,
     pub size: Decimal,
     pub filled: Decimal,
     pub status: OrderStatus,

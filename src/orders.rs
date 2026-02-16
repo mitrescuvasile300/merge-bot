@@ -83,6 +83,7 @@ impl OrderManager {
             token_id: token_id.to_string(),
             side,
             price,
+            fill_price: price, // Will be updated on fill with price improvement
             size,
             filled: Decimal::ZERO,
             status: OrderStatus::Open,
@@ -234,15 +235,18 @@ impl OrderManager {
             // Check if best ask <= our bid price
             if let Some(best_ask) = book.best_ask() {
                 if best_ask <= order.price {
-                    // Full fill
+                    // Full fill — price improvement: execute at ask, not our limit
+                    // On a real CLOB, if our limit is $0.48 and ask is $0.40,
+                    // we buy at $0.40 (price improvement). This matters for P&L accuracy.
                     order.filled = order.size;
+                    order.fill_price = best_ask; // Execute at the better price
                     order.status = OrderStatus::Filled;
                     filled_ids.push(order.id.clone());
 
                     info!(
                         order_id = %order.id,
                         side = %order.side,
-                        price = %order.price,
+                        price = %order.fill_price,
                         size = %order.size,
                         "[DRY-RUN] Order FILLED (best_ask={} <= our_bid={})",
                         best_ask, order.price
@@ -272,7 +276,7 @@ impl OrderManager {
             }
 
             total_shares += order.filled;
-            total_cost += order.filled * order.price;
+            total_cost += order.filled * order.fill_price;
         }
 
         (total_shares, total_cost)
