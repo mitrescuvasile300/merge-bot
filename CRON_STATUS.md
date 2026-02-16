@@ -1,40 +1,42 @@
 # Merge Bot Development Status
 
-## Current State: FIRST SUCCESSFUL DRY-RUN ✅
-- Code compiles cleanly (0 errors, 0 warnings)
-- 6 unit tests pass
-- **First end-to-end dry-run completed successfully**
-- 3 critical bugs fixed and pushed to GitHub
+## Current State: FIRST DRY-RUN COMPLETE ✅
+- Full 5-minute window tested end-to-end
+- Orders placed, fills simulated, merges executed, P&L tracked
+- Position imbalance limit added (max 60 shares ahead)
+- Markets traded counter fixed
+- Pushed to GitHub: https://github.com/mitrescuvasile300/merge-bot
 
-## Test Result: Window #1 (2026-02-16)
+## Latest Test Results (2026-02-16 03:33 UTC)
 | Metric | Value |
 |--------|-------|
-| Market | btc-updown-5m-1771211100 |
-| Orders Placed | 9 (7 UP, 2 DOWN) |
-| Orders Filled | 8 (6 UP, 2 DOWN) |
-| Pairs Merged | 40 |
-| Merge Profit | $5.08 (14.54% per merge) |
-| Unmerged Shares | 80 UP + 0 DOWN |
-| Capital After | $205.07 (started $215) |
-| Win Rate | 100% |
-
-## Bugs Fixed This Run
-1. **RwLock Deadlock** — `risk_manager.read()` guard held while calling `risk_manager.write()` in same block. Scoped read guard to drop before write.
-2. **should_buy() too restrictive** — `market_ask > max_side_price` check blocked ALL orders because simulated book asks were inflated from opening price mismatch. Replaced with bid-only checks.
-3. **Opening price mismatch** — Simulated order book used different opening price than strategy due to async timing. Fixed by deriving book prices from strategy's own fair values in dry-run mode.
+| Orders placed | 41 |
+| Merges executed | 7 |
+| Pairs merged | 260 |
+| Total invested | $216.23 |
+| Total payout | $260.00 |
+| Realized profit | $47.54 |
+| Win rate | 85.7% (1 losing merge) |
+| Unmerged position | 60 Up + 0 Down |
+| Final capital | $258.77 |
 
 ## Known Issues / Next Steps
-1. **Unmerged share risk** — Bot accumulates many UP shares but not enough DOWN. Need to add:
-   - Window-close P&L accounting for unmerged shares (they expire worthless)
-   - Better UP/DOWN balance: limit one-sided accumulation
-2. **Simulated BTC oscillation amplitude** — ±$50-80 may be too aggressive for 5-min windows. Real BTC 5-min moves are ~$20-40.
-3. **Need more test windows** (target: 3+ successful) before considering live mode
-4. **Merge pairs count** should be tracked correctly (merged 40 pairs from 2×20 share orders)
-5. **Add multi-window test** — Run with --max-windows 3 to test consecutive windows
+1. **Simulated P&L is unrealistically high** — BTC price feed oscillates too aggressively; real markets have tighter spreads and more competition. Need to calibrate the simulated feed.
+2. **Still heavy UP bias** — The simulated BTC often drops below opening, making UP cheap. Strategy correctly buys, but the price recovery creates large one-sided positions even with the 60-share imbalance cap.
+3. **Fill simulation too generous** — Orders fill instantly when bid >= ask. Need partial fills, competition, and slippage modeling.
+4. **Need `--sim-speed` flag** — Full 5-min windows take 5+ minutes real time. Add time compression for faster testing.
+5. **Multi-window test** — Run 3+ consecutive windows to test position carry-over and daily P&L tracking.
+6. **Tighten simulated spread** — Currently 2.5c; real markets may have 1-2c spreads.
 
 ## Architecture Notes
 - Simulated BTC feed oscillates ±$30-50 around $97,000 (deterministic sine waves)
-- In dry-run mode, order book is derived from strategy's own fair values (2.5c spread)
-- Strategy waits 90s entry delay, stops 30s before window close
-- Orders: 20 shares per order, limit BUY at fair value or below
+- Simulated order books derive from Black-Scholes fair value with 2.5c spread
+- Strategy uses entry_delay=5s, exit_buffer=3s for testing (prod: 90s, 30s)
+- Max side imbalance: 60 shares (prevents dangerous one-sided exposure)
+- Orders: 20 shares per order, limit BUY at fair value
 - Target edge: 2% per merge pair (combined cost < $0.98)
+
+## Test Command
+```bash
+timeout 420 ./target/release/merge-bot --max-windows 1 --log-level info --entry-delay 5 --exit-buffer 3
+```
