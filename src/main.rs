@@ -228,6 +228,26 @@ async fn run_dry_mode(config: Config) -> Result<()> {
 
         windows_traded += 1;
 
+        // Write per-window log file if log_dir is configured
+        if let Some(ref log_dir) = config.log_dir {
+            let report = merge_engine.window_report(&market.slug, windows_traded).await;
+            let log_path = std::path::Path::new(log_dir);
+            if let Err(e) = std::fs::create_dir_all(log_path) {
+                error!("Failed to create log dir: {:?}", e);
+            } else {
+                let filename = format!(
+                    "window_{}_{}.log",
+                    windows_traded,
+                    chrono::Utc::now().format("%Y%m%d_%H%M%S")
+                );
+                let filepath = log_path.join(&filename);
+                match std::fs::write(&filepath, &report) {
+                    Ok(_) => info!("Window report written to {}", filepath.display()),
+                    Err(e) => error!("Failed to write window report: {:?}", e),
+                }
+            }
+        }
+
         // Check if we should stop
         if config.max_windows > 0 && windows_traded >= config.max_windows {
             info!(
@@ -395,6 +415,26 @@ async fn run_live_mode(config: Config) -> Result<()> {
         pm_handle.abort();
 
         windows_traded += 1;
+
+        // Write per-window log file if log_dir is configured
+        if let Some(ref log_dir) = config.log_dir {
+            let report = merge_engine.window_report(&market.slug, windows_traded).await;
+            let log_path = std::path::Path::new(log_dir);
+            if let Err(e) = std::fs::create_dir_all(log_path) {
+                error!("Failed to create log dir: {:?}", e);
+            } else {
+                let filename = format!(
+                    "window_{}_{}.log",
+                    windows_traded,
+                    chrono::Utc::now().format("%Y%m%d_%H%M%S")
+                );
+                let filepath = log_path.join(&filename);
+                match std::fs::write(&filepath, &report) {
+                    Ok(_) => info!("Window report written to {}", filepath.display()),
+                    Err(e) => error!("Failed to write window report: {:?}", e),
+                }
+            }
+        }
 
         if config.max_windows > 0 && windows_traded >= config.max_windows {
             info!(
