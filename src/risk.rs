@@ -131,10 +131,20 @@ impl RiskManager {
         self.current_market_exposure += cost;
     }
 
-    /// Record a merge result
+    /// Record a merge result. Releases exposure for the merged cost.
     pub fn record_merge(&mut self, profit: Decimal, cost_returned: Decimal) {
         self.daily_pnl += profit;
         self.available_capital += cost_returned + profit;
+
+        // Release the exposure for merged pairs — those shares have been
+        // cashed out and no longer represent risk.
+        let release = cost_returned.min(self.current_market_exposure);
+        self.current_market_exposure -= release;
+        info!(
+            released_exposure = %release,
+            remaining_exposure = %self.current_market_exposure,
+            "Exposure released after merge"
+        );
 
         if profit > Decimal::ZERO {
             self.consecutive_losses = 0;
@@ -161,6 +171,13 @@ impl RiskManager {
         if self.daily_pnl < -(self.starting_capital * self.daily_stop_loss_pct) {
             self.halt("Daily stop loss exceeded");
         }
+    }
+
+    /// Release exposure for cancelled orders that never filled
+    pub fn release_cancelled_exposure(&mut self, cost: Decimal) {
+        let release = cost.min(self.current_market_exposure);
+        self.current_market_exposure -= release;
+        self.available_capital += cost;
     }
 
     /// Reset for a new market window

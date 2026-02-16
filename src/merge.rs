@@ -206,4 +206,52 @@ impl MergeEngine {
     pub async fn merge_history(&self) -> Vec<MergeResult> {
         self.merge_history.read().await.clone()
     }
+
+    /// Generate a per-window summary report as a formatted string
+    pub async fn window_report(&self, market_slug: &str, window_num: u64) -> String {
+        let pnl = self.pnl_snapshot().await;
+        let (up, down) = self.positions().await;
+        let history = self.merge_history().await;
+
+        let mut report = String::new();
+        report.push_str(&format!("═══════════════════════════════════════════\n"));
+        report.push_str(&format!("  MERGE BOT — Window #{} Report\n", window_num));
+        report.push_str(&format!("  Market: {}\n", market_slug));
+        report.push_str(&format!("  Time:   {} UTC\n", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")));
+        report.push_str(&format!("═══════════════════════════════════════════\n\n"));
+
+        report.push_str(&format!("POSITIONS AT WINDOW END:\n"));
+        report.push_str(&format!("  Up:   {} shares @ avg ${:.4}\n", up.shares, up.avg_cost));
+        report.push_str(&format!("  Down: {} shares @ avg ${:.4}\n", down.shares, down.avg_cost));
+        if up.avg_cost > rust_decimal::Decimal::ZERO && down.avg_cost > rust_decimal::Decimal::ZERO {
+            report.push_str(&format!("  Combined avg cost/pair: ${:.4}\n", up.avg_cost + down.avg_cost));
+        }
+        report.push_str("\n");
+
+        report.push_str(&format!("MERGES THIS WINDOW:\n"));
+        if history.is_empty() {
+            report.push_str("  No merges executed\n");
+        } else {
+            for (i, m) in history.iter().enumerate() {
+                report.push_str(&format!(
+                    "  #{}: {} pairs | cost ${:.4} | payout ${:.4} | profit ${:.4} ({:.2}%)\n",
+                    i + 1, m.pairs_merged, m.total_cost, m.total_payout, m.profit, m.profit_pct
+                ));
+            }
+        }
+        report.push_str("\n");
+
+        report.push_str(&format!("SESSION TOTALS:\n"));
+        report.push_str(&format!("  Total orders:       {}\n", pnl.total_orders));
+        report.push_str(&format!("  Total merges:       {}\n", pnl.total_merges));
+        report.push_str(&format!("  Total pairs merged: {}\n", pnl.total_pairs));
+        report.push_str(&format!("  Total invested:     ${:.4}\n", pnl.total_invested));
+        report.push_str(&format!("  Total payout:       ${:.4}\n", pnl.total_merged_payout));
+        report.push_str(&format!("  Total profit:       ${:.4}\n", pnl.total_profit));
+        report.push_str(&format!("  Win rate:           {:.1}%\n", pnl.win_rate * rust_decimal_macros::dec!(100)));
+        report.push_str(&format!("  Markets traded:     {}\n", pnl.markets_traded));
+        report.push_str(&format!("═══════════════════════════════════════════\n"));
+
+        report
+    }
 }

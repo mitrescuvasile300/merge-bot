@@ -303,10 +303,28 @@ impl MergeStrategy {
             risk.record_merge(merge_result.profit, merge_result.total_cost);
         }
 
-        // Cancel any remaining open orders
+        // Cancel any remaining open orders and release their exposure
+        let open_orders = self.order_manager.all_orders().await;
+        let mut cancelled_exposure = rust_decimal::Decimal::ZERO;
+        for order in &open_orders {
+            if order.status == crate::types::OrderStatus::Open
+                || order.status == crate::types::OrderStatus::PartialFill
+            {
+                let unfilled = order.size - order.filled;
+                cancelled_exposure += unfilled * order.price;
+            }
+        }
         let cancelled = self.order_manager.cancel_all().await?;
         if cancelled > 0 {
             info!("Cancelled {} remaining open orders at window close", cancelled);
+            self.risk_manager
+                .write()
+                .await
+                .release_cancelled_exposure(cancelled_exposure);
+            info!(
+                "Released ${:.2} exposure from cancelled orders",
+                cancelled_exposure
+            );
         }
 
         // Report results
@@ -386,9 +404,13 @@ impl MergeStrategy {
 
             if self.should_buy(Side::Up, our_up_bid, up_ask, snapshot) {
                 let order_cost = self.config.shares_per_order * our_up_bid;
-                let risk = self.risk_manager.read().await;
+                // Check risk THEN drop the read guard before potentially writing
+                let can_place = {
+                    let risk = self.risk_manager.read().await;
+                    risk.can_place_order(order_cost, open_orders)
+                }; // read guard dropped here
 
-                match risk.can_place_order(order_cost, open_orders) {
+                match can_place {
                     Ok(()) => {
                         match self
                             .order_manager
@@ -444,9 +466,12 @@ impl MergeStrategy {
 
             if self.should_buy(Side::Down, our_down_bid, down_ask, snapshot) {
                 let order_cost = self.config.shares_per_order * our_down_bid;
-                let risk = self.risk_manager.read().await;
+                let can_place = {
+                    let risk = self.risk_manager.read().await;
+                    risk.can_place_order(order_cost, open_orders + placed as usize)
+                }; // read guard dropped
 
-                match risk.can_place_order(order_cost, open_orders + placed as usize) {
+                match can_place {
                     Ok(()) => {
                         match self
                             .order_manager

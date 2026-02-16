@@ -39,6 +39,10 @@ pub struct CliArgs {
     #[arg(long, default_value_t = false)]
     pub json_logs: bool,
 
+    /// Directory to write per-window log files (one .log per 5-min market)
+    #[arg(long, default_value = "")]
+    pub log_dir: String,
+
     /// Entry delay in seconds (wait after market opens before trading)
     #[arg(long, default_value_t = 90)]
     pub entry_delay: u64,
@@ -97,6 +101,9 @@ pub struct Config {
     // === Limits ===
     pub max_windows: u64,
     pub json_logs: bool,
+
+    // === Per-window file logging ===
+    pub log_dir: Option<String>,
 }
 
 impl Config {
@@ -130,7 +137,7 @@ impl Config {
             daily_stop_loss_pct: dec!(0.15),
             consecutive_loss_limit: 5,
             max_open_orders: 20,
-            max_exposure_per_market: dec!(50.0), // Max $50 per market window
+            max_exposure_per_market: dec!(100.0), // Max $100 per market window (~46% of capital)
 
             // API Credentials
             polymarket_api_key: std::env::var("POLYMARKET_API_KEY").ok(),
@@ -147,6 +154,13 @@ impl Config {
             // Limits
             max_windows: args.max_windows,
             json_logs: args.json_logs,
+
+            // Per-window file logging
+            log_dir: if args.log_dir.is_empty() {
+                None
+            } else {
+                Some(args.log_dir.clone())
+            },
         }
     }
 
