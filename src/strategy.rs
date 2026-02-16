@@ -630,6 +630,30 @@ impl MergeStrategy {
             return false;
         }
 
+        // CRITICAL FIX: Don't buy at extreme fair values (> 0.80 or < 0.20).
+        // When one side is at an extreme, the combined cost of Up + Down > $1.00,
+        // making merges unprofitable. Only buy when prices are balanced.
+        if fair_value > dec!(0.80) || fair_value < dec!(0.20) {
+            debug!(
+                side = %side,
+                fv = %fair_value,
+                "Skipping: extreme fair value — merge would be unprofitable",
+            );
+            return false;
+        }
+
+        // CRITICAL FIX: Don't buy in the last 30 seconds of the window.
+        // Near expiry, fair values go to extremes (0.99 or 0.01) making
+        // any purchase likely to be on the wrong side of a binary outcome.
+        if snapshot.remaining_secs < 30 {
+            debug!(
+                side = %side,
+                remaining = snapshot.remaining_secs,
+                "Skipping: too close to expiry (< 30s)",
+            );
+            return false;
+        }
+
         // Directional preference: buy each side when it's the "cheap" side.
         // BTC below opening → Up is cheap; BTC above opening → Down is cheap.
         // Use 0.03% tolerance so both sides can be bought near the opening price.
