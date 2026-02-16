@@ -171,11 +171,13 @@ impl SimulatedBinanceFeed {
         let mut step = 0u64;
 
         loop {
-            // Simulate BTC oscillation: ±$10-50 random walk
-            // Use a simple deterministic oscillation for reproducibility
-            let phase = (step as f64 * 0.1).sin() * 30.0
-                + (step as f64 * 0.23).sin() * 15.0
-                + (step as f64 * 0.07).cos() * 20.0;
+            // Simulate BTC oscillation: ±$50-100 deterministic walk
+            // Larger amplitude to exercise both sides of the strategy.
+            // Multiple frequencies create realistic-looking zigzag movement.
+            let phase = (step as f64 * 0.08).sin() * 55.0
+                + (step as f64 * 0.19).sin() * 35.0
+                + (step as f64 * 0.31).sin() * 20.0
+                + (step as f64 * 0.05).cos() * 30.0;
 
             let delta = Decimal::from_f64_retain(phase).unwrap_or(Decimal::ZERO);
             let current_price = self.initial_price + delta;

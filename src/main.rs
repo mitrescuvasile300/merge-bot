@@ -133,8 +133,10 @@ async fn run_dry_mode(config: Config) -> Result<()> {
                 let tick = btc_rx.borrow().clone();
                 if let Some(ref tick) = tick {
                     *btc_price_state2.write().await = Some(tick.clone());
-                    // Update simulated order books based on BTC price
-                    let remaining = 150u64; // Approximate
+                    // Compute approximate remaining time in current 5-min window
+                    let now = chrono::Utc::now().timestamp() as u64;
+                    let window_end = now - (now % 300) + 300;
+                    let remaining = window_end.saturating_sub(now);
                     sim_pm_clone
                         .update_from_btc_price(tick.price, remaining)
                         .await;
@@ -158,8 +160,32 @@ async fn run_dry_mode(config: Config) -> Result<()> {
     let mut windows_traded = 0u64;
 
     loop {
-        // Create a simulated market
-        let (window_start, window_end) = MarketDiscovery::current_window();
+        // Check if the current window has enough time remaining.
+        // If not, wait for the next 5-minute window to start fresh.
+        let (mut window_start, mut window_end) = MarketDiscovery::current_window();
+        let now = chrono::Utc::now().timestamp() as u64;
+        let min_trading_time = config.entry_delay_secs + config.exit_buffer_secs + 60; // Need at least 60s of actual trading
+
+        if window_end.saturating_sub(now) < min_trading_time {
+            let wait = window_end.saturating_sub(now) + 1;
+            info!(
+                "Current window has < {}s remaining, waiting {}s for next window...",
+                min_trading_time, wait
+            );
+            tokio::time::sleep(tokio::time::Duration::from_secs(wait)).await;
+            let next = MarketDiscovery::current_window();
+            window_start = next.0;
+            window_end = next.1;
+        }
+
+        // Get current BTC price as opening for this window
+        let current_btc = btc_price_state.read().await.as_ref().map(|t| t.price);
+
+        // Sync the simulated order book's opening price with the strategy's
+        if let Some(price) = current_btc {
+            sim_polymarket.set_opening_price(price).await;
+        }
+
         let market = types::Market {
             condition_id: format!("sim-condition-{}", window_start),
             slug: MarketDiscovery::expected_slug(window_start),
@@ -167,7 +193,7 @@ async fn run_dry_mode(config: Config) -> Result<()> {
             down_token_id: format!("sim-down-{}", window_start),
             window_start,
             window_end,
-            opening_price: btc_price_state.read().await.as_ref().map(|t| t.price),
+            opening_price: current_btc,
             active: true,
         };
 

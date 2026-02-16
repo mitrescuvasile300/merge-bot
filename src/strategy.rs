@@ -115,7 +115,6 @@ impl MergeStrategy {
         self.risk_manager.write().await.reset_market_exposure();
 
         let mut total_orders = 0u64;
-        let mut last_order_time = std::time::Instant::now();
 
         // Phase 2: Active trading loop
         loop {
@@ -130,12 +129,8 @@ impl MergeStrategy {
                 break;
             }
 
-            // Rate limit: wait between orders
-            let since_last = last_order_time.elapsed();
-            if since_last < self.config.order_interval {
-                let wait = self.config.order_interval - since_last;
-                tokio::time::sleep(wait).await;
-            }
+            // Always sleep between iterations (core rate limit)
+            tokio::time::sleep(self.config.order_interval).await;
 
             // Get current BTC price
             let btc_tick = match btc_price_fn() {
@@ -167,17 +162,39 @@ impl MergeStrategy {
                     sigma,
                     remaining as u64,
                 );
+                let fair_down = Decimal::ONE - fair_up;
+
+                // In dry-run mode, derive book prices from our own fair value
+                // to avoid the async opening-price mismatch with the simulated feed.
+                // In live mode, use the actual Polymarket order book.
+                let (up_best_ask, down_best_ask, up_best_bid, down_best_bid) =
+                    if self.config.dry_run {
+                        let spread = dec!(0.025); // 2.5c spread from fair (realistic)
+                        (
+                            Some((fair_up + spread).min(dec!(0.99))),
+                            Some((fair_down + spread).min(dec!(0.99))),
+                            Some((fair_up - spread).max(dec!(0.01))),
+                            Some((fair_down - spread).max(dec!(0.01))),
+                        )
+                    } else {
+                        (
+                            book_state.up_book.best_ask(),
+                            book_state.down_book.best_ask(),
+                            book_state.up_book.best_bid(),
+                            book_state.down_book.best_bid(),
+                        )
+                    };
 
                 MarketSnapshot {
                     btc_price: btc_tick.price,
                     opening_price,
                     remaining_secs: remaining as u64,
-                    up_best_ask: book_state.up_book.best_ask(),
-                    down_best_ask: book_state.down_book.best_ask(),
-                    up_best_bid: book_state.up_book.best_bid(),
-                    down_best_bid: book_state.down_book.best_bid(),
+                    up_best_ask,
+                    down_best_ask,
+                    up_best_bid,
+                    down_best_bid,
                     fair_value_up: fair_up,
-                    fair_value_down: Decimal::ONE - fair_up,
+                    fair_value_down: fair_down,
                     sigma,
                 }
             };
@@ -200,19 +217,58 @@ impl MergeStrategy {
             let placed = self.evaluate_and_place_orders(market, &snapshot).await?;
             if placed > 0 {
                 total_orders += placed;
-                last_order_time = std::time::Instant::now();
+                info!(
+                    "Orders placed this cycle: {} | Total: {} | Open: {}",
+                    placed,
+                    total_orders,
+                    self.order_manager.open_order_count().await,
+                );
+            } else {
+                debug!(
+                    "No orders placed | Open: {} | BTC: {} | FV up: {} | FV down: {}",
+                    self.order_manager.open_order_count().await,
+                    snapshot.btc_price,
+                    snapshot.fair_value_up,
+                    snapshot.fair_value_down,
+                );
             }
 
-            // In dry-run mode, simulate fills
+            // In dry-run mode, simulate fills using strategy-consistent fair values
             if self.config.dry_run {
-                let book_state = books.read().await;
+                use crate::types::{BookLevel, OrderBook};
+
+                // Build order books from our own fair values (not the async-lagged feed)
+                let spread = dec!(0.025);
+                let sim_up_book = OrderBook {
+                    bids: vec![BookLevel {
+                        price: (snapshot.fair_value_up - spread).max(dec!(0.01)),
+                        size: dec!(500),
+                    }],
+                    asks: vec![BookLevel {
+                        price: (snapshot.fair_value_up + spread).min(dec!(0.99)),
+                        size: dec!(500),
+                    }],
+                    timestamp: Some(chrono::Utc::now()),
+                };
+                let sim_down_book = OrderBook {
+                    bids: vec![BookLevel {
+                        price: (snapshot.fair_value_down - spread).max(dec!(0.01)),
+                        size: dec!(500),
+                    }],
+                    asks: vec![BookLevel {
+                        price: (snapshot.fair_value_down + spread).min(dec!(0.99)),
+                        size: dec!(500),
+                    }],
+                    timestamp: Some(chrono::Utc::now()),
+                };
+
                 let up_fills = self
                     .order_manager
-                    .simulate_fills(&book_state.up_book, &market.up_token_id)
+                    .simulate_fills(&sim_up_book, &market.up_token_id)
                     .await;
                 let down_fills = self
                     .order_manager
-                    .simulate_fills(&book_state.down_book, &market.down_token_id)
+                    .simulate_fills(&sim_down_book, &market.down_token_id)
                     .await;
 
                 // Record fills in merge engine
@@ -296,40 +352,64 @@ impl MergeStrategy {
 
         // Calculate target buy prices based on merge profitability
         // We want: up_price + down_price < 1.0 - target_edge
-        // Strategy: use the opposite side's current best ask as reference
         let target_combined = Decimal::ONE - self.config.target_edge;
 
         // === Evaluate buying Up tokens ===
         // When BTC is below opening price, Up tokens are cheaper → good time to buy
         if let Some(up_ask) = snapshot.up_best_ask {
-            let our_up_bid = self.calculate_bid_price(
+            let raw_bid = self.calculate_bid_price(
                 Side::Up,
                 snapshot,
                 &down_pos,
                 target_combined,
             );
 
+            // CRITICAL: If our bid would cross the ask, cap it at the ask price.
+            // This ensures we buy at the ask (immediate fill) rather than overpaying.
+            // Posting at exactly the ask makes us a taker on Polymarket, so use ask - 0.01
+            // to stay maker when possible, or use the ask itself if it's already below our target.
+            let our_up_bid = if raw_bid > up_ask {
+                up_ask // Buy at the ask (the token is cheap enough)
+            } else {
+                raw_bid
+            };
+
+            debug!(
+                side = "UP",
+                bid = %our_up_bid,
+                raw_bid = %raw_bid,
+                ask = %up_ask,
+                fv = %snapshot.fair_value_up,
+                down_pos_shares = %down_pos.shares,
+                "Bid calculation"
+            );
+
             if self.should_buy(Side::Up, our_up_bid, up_ask, snapshot) {
                 let order_cost = self.config.shares_per_order * our_up_bid;
                 let risk = self.risk_manager.read().await;
 
-                if risk.can_place_order(order_cost, open_orders).is_ok() {
-                    match self
-                        .order_manager
-                        .place_limit_buy(
-                            &market.condition_id,
-                            &market.up_token_id,
-                            Side::Up,
-                            our_up_bid,
-                            self.config.shares_per_order,
-                        )
-                        .await
-                    {
-                        Ok(_) => {
-                            self.risk_manager.write().await.record_order(order_cost);
-                            placed += 1;
+                match risk.can_place_order(order_cost, open_orders) {
+                    Ok(()) => {
+                        match self
+                            .order_manager
+                            .place_limit_buy(
+                                &market.condition_id,
+                                &market.up_token_id,
+                                Side::Up,
+                                our_up_bid,
+                                self.config.shares_per_order,
+                            )
+                            .await
+                        {
+                            Ok(_) => {
+                                self.risk_manager.write().await.record_order(order_cost);
+                                placed += 1;
+                            }
+                            Err(e) => debug!("Failed to place Up order: {:?}", e),
                         }
-                        Err(e) => debug!("Failed to place Up order: {:?}", e),
+                    }
+                    Err(reason) => {
+                        debug!(side = "UP", reason = %reason, "Risk check rejected order");
                     }
                 }
             }
@@ -338,34 +418,56 @@ impl MergeStrategy {
         // === Evaluate buying Down tokens ===
         // When BTC is above opening price, Down tokens are cheaper → good time to buy
         if let Some(down_ask) = snapshot.down_best_ask {
-            let our_down_bid = self.calculate_bid_price(
+            let raw_bid = self.calculate_bid_price(
                 Side::Down,
                 snapshot,
                 &up_pos,
                 target_combined,
             );
 
+            // Same crossing fix for Down side
+            let our_down_bid = if raw_bid > down_ask {
+                down_ask
+            } else {
+                raw_bid
+            };
+
+            debug!(
+                side = "DOWN",
+                bid = %our_down_bid,
+                raw_bid = %raw_bid,
+                ask = %down_ask,
+                fv = %snapshot.fair_value_down,
+                up_pos_shares = %up_pos.shares,
+                "Bid calculation"
+            );
+
             if self.should_buy(Side::Down, our_down_bid, down_ask, snapshot) {
                 let order_cost = self.config.shares_per_order * our_down_bid;
                 let risk = self.risk_manager.read().await;
 
-                if risk.can_place_order(order_cost, open_orders + placed as usize).is_ok() {
-                    match self
-                        .order_manager
-                        .place_limit_buy(
-                            &market.condition_id,
-                            &market.down_token_id,
-                            Side::Down,
-                            our_down_bid,
-                            self.config.shares_per_order,
-                        )
-                        .await
-                    {
-                        Ok(_) => {
-                            self.risk_manager.write().await.record_order(order_cost);
-                            placed += 1;
+                match risk.can_place_order(order_cost, open_orders + placed as usize) {
+                    Ok(()) => {
+                        match self
+                            .order_manager
+                            .place_limit_buy(
+                                &market.condition_id,
+                                &market.down_token_id,
+                                Side::Down,
+                                our_down_bid,
+                                self.config.shares_per_order,
+                            )
+                            .await
+                        {
+                            Ok(_) => {
+                                self.risk_manager.write().await.record_order(order_cost);
+                                placed += 1;
+                            }
+                            Err(e) => debug!("Failed to place Down order: {:?}", e),
                         }
-                        Err(e) => debug!("Failed to place Down order: {:?}", e),
+                    }
+                    Err(reason) => {
+                        debug!(side = "DOWN", reason = %reason, "Risk check rejected order");
                     }
                 }
             }
@@ -401,51 +503,80 @@ impl MergeStrategy {
         // Our max bid = target_combined - other_side_cost
         let max_bid = target_combined - other_cost;
 
-        // Don't bid above fair value (we want edge)
+        // Don't bid above fair value (we want edge, not overpay)
         let bid = max_bid.min(fair_value);
 
-        // Clamp to configured bounds
-        bid.max(self.config.min_side_price)
+        // Clamp: minimum 1c (Polymarket floor), max per config
+        // NOTE: We intentionally use 0.01 as floor, NOT min_side_price.
+        // The old min_side_price (0.20-0.35) would force bids above fair value
+        // when a token is cheap, causing the fair_value check in should_buy to reject.
+        bid.max(dec!(0.01))
             .min(self.config.max_side_price)
     }
 
-    /// Determine if we should place a buy order for this side
+    /// Determine if we should place a buy order for this side.
+    ///
+    /// The bid has already been adjusted in evaluate_and_place_orders (capped at ask
+    /// to prevent crossing). So here we only check value and directional filters.
     fn should_buy(
         &self,
         side: Side,
         our_bid: Decimal,
-        market_ask: Decimal,
+        _market_ask: Decimal,
         snapshot: &MarketSnapshot,
     ) -> bool {
-        // Basic validity checks
-        if our_bid < self.config.min_side_price || our_bid > self.config.max_side_price {
+        // Basic validity: bid must be in Polymarket's range [0.01, 0.99]
+        if our_bid < dec!(0.01) || our_bid > dec!(0.99) {
             return false;
         }
 
-        // Only buy if our bid is competitive (at or near the ask)
-        // For maker orders, we post below the ask to get filled when price comes to us
-        let price_ok = our_bid <= market_ask + dec!(0.02);
+        // Don't overpay: bid must not exceed max_side_price
+        if our_bid > self.config.max_side_price {
+            return false;
+        }
 
-        // Directional filter: prefer buying when this side is cheap
-        let btc_delta = snapshot.btc_price - snapshot.opening_price;
-        let directional_ok = match side {
-            // Buy Up when BTC is dipping (Up tokens cheaper)
-            Side::Up => btc_delta <= dec!(0),
-            // Buy Down when BTC is rising (Down tokens cheaper)
-            Side::Down => btc_delta >= dec!(0),
-        };
-
-        // Price must be in reasonable range
+        // Fair value check: don't bid more than 2c above Black-Scholes fair value.
+        // This prevents overpaying for tokens. The bid is already capped at fair_value
+        // in calculate_bid_price, but the ask-cap in evaluate_and_place may have lowered it
+        // further, so this check should almost always pass.
         let fair_value = match side {
             Side::Up => snapshot.fair_value_up,
             Side::Down => snapshot.fair_value_down,
         };
-        let value_ok = our_bid <= fair_value + dec!(0.02);
+        if our_bid > fair_value + dec!(0.02) {
+            debug!(
+                side = %side,
+                bid = %our_bid,
+                fv = %fair_value,
+                "Skipping: bid {:.3} > fv {:.3} + 0.02",
+                our_bid, fair_value,
+            );
+            return false;
+        }
 
-        // Don't buy if the side is too expensive (price > 55c means other side < 45c)
-        let cheap_enough = market_ask <= self.config.max_side_price;
+        // Directional preference: buy each side when it's the "cheap" side.
+        // BTC below opening → Up is cheap; BTC above opening → Down is cheap.
+        // Use 0.03% tolerance so both sides can be bought near the opening price.
+        let btc_delta_pct = if snapshot.opening_price > Decimal::ZERO {
+            (snapshot.btc_price - snapshot.opening_price) / snapshot.opening_price
+        } else {
+            Decimal::ZERO
+        };
 
-        price_ok && (directional_ok || our_bid < fair_value - dec!(0.02)) && value_ok && cheap_enough
+        let is_cheap_side = match side {
+            Side::Up => btc_delta_pct < dec!(0.0003),    // BTC flat or dipping
+            Side::Down => btc_delta_pct > dec!(-0.0003),  // BTC flat or rising
+        };
+
+        if !is_cheap_side {
+            // Even if not the preferred side, accept bargains below fair value
+            if our_bid < fair_value - dec!(0.02) {
+                return true;
+            }
+            return false;
+        }
+
+        true
     }
 }
 

@@ -258,15 +258,15 @@ impl PolymarketFeed {
 /// Generates realistic order book data based on BTC price movements.
 pub struct SimulatedPolymarketFeed {
     books: Arc<RwLock<MarketBooks>>,
-    /// BTC opening price for the window
-    opening_price: Decimal,
+    /// BTC opening price for the window (updatable per-window)
+    opening_price: Arc<RwLock<Decimal>>,
 }
 
 impl SimulatedPolymarketFeed {
     pub fn new(opening_price: Decimal) -> Self {
         Self {
             books: Arc::new(RwLock::new(MarketBooks::default())),
-            opening_price,
+            opening_price: Arc::new(RwLock::new(opening_price)),
         }
     }
 
@@ -274,7 +274,15 @@ impl SimulatedPolymarketFeed {
         self.books.clone()
     }
 
-    /// Update simulated books based on current BTC price
+    /// Update opening price at the start of each new window
+    pub async fn set_opening_price(&self, price: Decimal) {
+        *self.opening_price.write().await = price;
+    }
+
+    /// Update simulated books based on current BTC price.
+    ///
+    /// Uses a realistic 5-cent spread (real Polymarket 5-min options have 3-8c spreads).
+    /// The book has 3 levels of depth at increasing spreads.
     pub async fn update_from_btc_price(
         &self,
         btc_price: Decimal,
@@ -282,32 +290,44 @@ impl SimulatedPolymarketFeed {
     ) {
         let pricer = crate::pricing::BinaryPricer::new();
         let sigma = crate::pricing::VolatilityEstimator::default_volatility();
+        let opening = *self.opening_price.read().await;
 
-        let fair_up = pricer.fair_value_up(btc_price, self.opening_price, sigma, remaining_secs);
+        let fair_up = pricer.fair_value_up(btc_price, opening, sigma, remaining_secs);
         let fair_down = Decimal::ONE - fair_up;
 
-        let spread = rust_decimal_macros::dec!(0.02); // 2 cent spread
-        let half_spread = spread / Decimal::TWO;
+        // Realistic spread: 5c total (2.5c each side of fair value)
+        // With deeper levels at 4c and 6c from fair
+        let spread_l1 = rust_decimal_macros::dec!(0.025); // Tight: 2.5c from fair
+        let spread_l2 = rust_decimal_macros::dec!(0.04);  // Mid: 4c from fair
+        let spread_l3 = rust_decimal_macros::dec!(0.06);  // Wide: 6c from fair
 
         let up_book = OrderBook {
             bids: vec![
                 BookLevel {
-                    price: (fair_up - half_spread).max(rust_decimal_macros::dec!(0.01)),
-                    size: rust_decimal_macros::dec!(100),
+                    price: (fair_up - spread_l1).max(rust_decimal_macros::dec!(0.01)),
+                    size: rust_decimal_macros::dec!(50),
                 },
                 BookLevel {
-                    price: (fair_up - spread).max(rust_decimal_macros::dec!(0.01)),
-                    size: rust_decimal_macros::dec!(200),
+                    price: (fair_up - spread_l2).max(rust_decimal_macros::dec!(0.01)),
+                    size: rust_decimal_macros::dec!(150),
+                },
+                BookLevel {
+                    price: (fair_up - spread_l3).max(rust_decimal_macros::dec!(0.01)),
+                    size: rust_decimal_macros::dec!(300),
                 },
             ],
             asks: vec![
                 BookLevel {
-                    price: (fair_up + half_spread).min(rust_decimal_macros::dec!(0.99)),
-                    size: rust_decimal_macros::dec!(100),
+                    price: (fair_up + spread_l1).min(rust_decimal_macros::dec!(0.99)),
+                    size: rust_decimal_macros::dec!(50),
                 },
                 BookLevel {
-                    price: (fair_up + spread).min(rust_decimal_macros::dec!(0.99)),
-                    size: rust_decimal_macros::dec!(200),
+                    price: (fair_up + spread_l2).min(rust_decimal_macros::dec!(0.99)),
+                    size: rust_decimal_macros::dec!(150),
+                },
+                BookLevel {
+                    price: (fair_up + spread_l3).min(rust_decimal_macros::dec!(0.99)),
+                    size: rust_decimal_macros::dec!(300),
                 },
             ],
             timestamp: Some(Utc::now()),
@@ -316,22 +336,30 @@ impl SimulatedPolymarketFeed {
         let down_book = OrderBook {
             bids: vec![
                 BookLevel {
-                    price: (fair_down - half_spread).max(rust_decimal_macros::dec!(0.01)),
-                    size: rust_decimal_macros::dec!(100),
+                    price: (fair_down - spread_l1).max(rust_decimal_macros::dec!(0.01)),
+                    size: rust_decimal_macros::dec!(50),
                 },
                 BookLevel {
-                    price: (fair_down - spread).max(rust_decimal_macros::dec!(0.01)),
-                    size: rust_decimal_macros::dec!(200),
+                    price: (fair_down - spread_l2).max(rust_decimal_macros::dec!(0.01)),
+                    size: rust_decimal_macros::dec!(150),
+                },
+                BookLevel {
+                    price: (fair_down - spread_l3).max(rust_decimal_macros::dec!(0.01)),
+                    size: rust_decimal_macros::dec!(300),
                 },
             ],
             asks: vec![
                 BookLevel {
-                    price: (fair_down + half_spread).min(rust_decimal_macros::dec!(0.99)),
-                    size: rust_decimal_macros::dec!(100),
+                    price: (fair_down + spread_l1).min(rust_decimal_macros::dec!(0.99)),
+                    size: rust_decimal_macros::dec!(50),
                 },
                 BookLevel {
-                    price: (fair_down + spread).min(rust_decimal_macros::dec!(0.99)),
-                    size: rust_decimal_macros::dec!(200),
+                    price: (fair_down + spread_l2).min(rust_decimal_macros::dec!(0.99)),
+                    size: rust_decimal_macros::dec!(150),
+                },
+                BookLevel {
+                    price: (fair_down + spread_l3).min(rust_decimal_macros::dec!(0.99)),
+                    size: rust_decimal_macros::dec!(300),
                 },
             ],
             timestamp: Some(Utc::now()),

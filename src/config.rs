@@ -28,7 +28,7 @@ pub struct CliArgs {
     pub max_windows: u64,
 
     /// Target edge per merge pair (combined cost below $1 by this amount)
-    #[arg(long, default_value_t = 0.03)]
+    #[arg(long, default_value_t = 0.02)]
     pub target_edge: f64,
 
     /// Shares per order
@@ -38,6 +38,14 @@ pub struct CliArgs {
     /// Output JSON logs
     #[arg(long, default_value_t = false)]
     pub json_logs: bool,
+
+    /// Entry delay in seconds (wait after market opens before trading)
+    #[arg(long, default_value_t = 90)]
+    pub entry_delay: u64,
+
+    /// Exit buffer in seconds (stop trading this many secs before window close)
+    #[arg(long, default_value_t = 30)]
+    pub exit_buffer: u64,
 }
 
 /// Full bot configuration derived from CLI args + env vars
@@ -112,16 +120,16 @@ impl Config {
                 .unwrap_or(dec!(0.03)),
             shares_per_order: Decimal::from(args.shares_per_order),
             min_order_shares: dec!(5),
-            entry_delay_secs: 90,    // Start ~90s after window opens
-            exit_buffer_secs: 30,    // Stop 30s before close
-            order_interval: Duration::from_secs(3), // Every 2-5 seconds
-            max_side_price: dec!(0.55),  // Never pay more than 55c for one side
-            min_side_price: dec!(0.35),  // Ignore if price below 35c (too directional)
+            entry_delay_secs: args.entry_delay,
+            exit_buffer_secs: args.exit_buffer,
+            order_interval: Duration::from_secs(2), // Every 2 seconds
+            max_side_price: dec!(0.65),  // Never pay more than 65c for one side
+            min_side_price: dec!(0.01),  // Polymarket minimum tick (not used as bid floor anymore)
 
             // Risk
             daily_stop_loss_pct: dec!(0.15),
             consecutive_loss_limit: 5,
-            max_open_orders: 10,
+            max_open_orders: 20,
             max_exposure_per_market: dec!(50.0), // Max $50 per market window
 
             // API Credentials
