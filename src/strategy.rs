@@ -251,7 +251,7 @@ impl MergeStrategy {
                 let down_mtm = down_pos.shares * snapshot.fair_value_down;
                 self.window_cash_pnl + up_mtm + down_mtm
             };
-            let mtm_blocked = mtm_pnl < dec!(-3); // v13: tighter MTM loss cap ($3 vs $5)
+            let mtm_blocked = mtm_pnl < dec!(-5);
             if mtm_blocked {
                 debug!(
                     mtm_pnl = %mtm_pnl,

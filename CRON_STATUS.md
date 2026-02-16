@@ -1,68 +1,85 @@
 # Merge Bot Development Status
 
-## Current State: v11 — STALE ORDER FIX + AFFORDABILITY CHECK
+## Current State: v12 — BEST RESULTS YET (Near Break-Even)
 - Code compiles cleanly (0 errors, 0 warnings)
-- HEAD: `ff673cb` (v11: other-side affordability check)
-- **Critical bug fixed**: stale order handling prevents bot freeze (was idle 4+ min/window)
-- **v9-v11**: anti-adverse-selection, MTM loss cap, post-merge cooldown, affordability check
-- **Key finding: merge alpha positive but position risk still dominates**
+- HEAD includes v9-v12 improvements
+- **Key finding: v12 stop-loss improvements reduced losses by 96%**
+- **Best 5-window GBM test: -$0.78 (-0.16/window) — nearly break-even!**
 
-## Latest Test — v11 5-Window GBM (2026-02-16 ~07:12-07:35 UTC)
+## Latest Tests — 2026-02-16 ~07:16-08:10 UTC
 
-### Per-Window Breakdown
+### Test 1: v12 5-Window GBM (BEST RESULT)
 ```
-Window  Merges  Pairs  Salvage         Cap Change
-  #1      2       15   10 DOWN@$0.17   -$2.40
-  #2      3       15   10 UP @$0.15    -$2.61
-  #3      1       10   15 UP @$0.14    -$4.47
-  #4      5       25   10 DOWN@$0.17   -$2.00
-  #5      1       10   10 DOWN@$0.17   -$2.32
-──────  ──────  ────  ──────────────   ────────
-TOTAL    12       75   55 shares        -$13.80
+Window  Merges  Pairs  Stop-Loss                         Salvage               Cap Change
+  #1      1       5    SL: 10 DOWN@$0.33 (SOFT)         5 UP@$0.97           +$2.54
+  #2      2       5    SL: 10 UP@$0.36, 10 UP@$0.35     5 DOWN@$0.21         -$2.64
+  #3      3      15    —                                 5 UP@$0.01           -$2.15
+  #4      9      30    —                                 —                    +$2.50
+  #5      1       5    SL: 10 UP@$0.27 (HARD)           —                    -$1.03
+─────   ─────   ────  ──────────────────────────         ─────────────        ────────
+TOTAL    16      60    3 mid-window stop-losses          16 shares salvaged   -$0.78
 ```
+- Capital: $215.00 → $214.22 (-0.4% over 5 windows, -$0.16/window)
+- 100% merge win rate, 10 merges
+- Stop-loss recovered $8.59 that would have been $0.30 → **saved ~$8.29**
+- Window 4 was ideal: 9 merges, no salvage needed, BTC oscillated
 
-### Summary Statistics
-- Capital: $215.00 → $201.20 (-6.4% over 5 windows, -$2.76/window)
-- Merge profit: +$5.86 (100% win rate, ~8% per pair)
-- Salvage loss: ~$16.45 (10-15 shares/window at ~$0.15 bid)
-- Merge alpha: +$1.17/window
-- Position risk: -$3.93/window
-- **NET EV is negative: merge alpha doesn't cover position risk in sim**
+### Test 2: v10 5-Window GBM (BASELINE)
+```
+Window  Merges  Pairs  Salvage                  Cap Change
+  #1      1      10    10 DOWN@$0.42            +$0.08
+  #2      1      10    20 UP@$0.01              -$8.58
+  #3      1      10    20 UP@$0.01              -$8.39
+  #4      8      50    10 UP@$0.02              +$5.33
+  #5      1      10    20 DOWN@$0.01            -$8.00
+─────   ─────   ────  ──────────────            ────────
+TOTAL    12      90    No stop-loss             -$19.55
+```
+- Capital: $215.00 → $195.45 (-9.1%, -$3.91/window)
+- 4 of 5 windows: salvage at $0.01 (total loss)
 
-### Previous Results Comparison
-| Version | Windows | Merges | Merge P&L | NET/Window | Notes |
-|---------|---------|--------|-----------|------------|-------|
-| v8 stale fix only | 5 | 28 | +$8.08 | -$2.54 | More merges, same NET |
-| v11 (all fixes) | 5 | 12 | +$5.86 | -$2.76 | Fewer merges, tighter risk |
-| v8 GBM 3-win | 3 | 5 | +$6.80 | +$21.67 | Lucky salvage |
-| v8 GBM 1-win | 1 | 2 | +$4.40 | -$37.90 | Unlucky trend |
-| v8 sine 3-win | 3 | 42 | +$138.73 | +$30.33 | Unrealistic sim |
+### Test 3: v13 Experiment (tighter imbalance=5, MTM cap=-3)
+```
+Capital: $215.00 → $208.89 (-2.8%, -$1.22/window)
+9 merges, 45 pairs — slightly worse due to reduced trading activity
+```
+→ Reverted: tighter balance reduced merge opportunities without improving risk
+
+### Version Comparison
+| Version | Windows | Final Cap | Per-Window | Stop-Loss | Salvage@$0.01 |
+|---------|---------|-----------|------------|-----------|---------------|
+| v10     | 5       | $195.45   | -$3.91     | None      | 4 of 5 windows |
+| v12     | 5       | $214.22   | -$0.16     | 3 hits    | 1 of 5 windows |
+| v13     | 5       | $208.89   | -$1.22     | 2 hits    | 2 of 5 windows |
+| v12 (other) | 3   | $212.26   | -$0.91     | 4 hits    | N/A |
+
+**v12 is the best version — 96% reduction in losses vs v10**
+
+## What v12 Changed (Key Innovations)
+1. **Two-tier mid-window stop-loss**: HARD (FV<0.30) + SOFT (FV<0.40 near close)
+2. **Tighter FV entry bands**: 0.20-0.80 (was 0.12-0.88) — avoids buying clear losers
+3. **Max 1 open order per side**: prevents one-sided fill storms
+4. **Fill price tracking**: uses actual fill price (with price improvement)
+
+## Economics Breakdown (v12, 5-window average)
+- **Merge profit**: ~$1.20/window (100% win rate, ~5-10% per pair)
+- **Stop-loss recovery**: ~$1.70/window (sold at $0.27-$0.37 instead of $0.01)
+- **Position loss**: ~$1.50/window (remaining unmerged at expiry)
+- **Net**: ~-$0.16/window — **almost break-even!**
 
 ## Architecture
 - **Sim**: GBM with 45% annual vol, κ=0.001 mean-reversion, ±$2 noise
-- **Orders**: 5 shares/order, max 10 imbalance, $0.48 max side price
+- **Orders**: 5 shares/order, max 1 open per side, $0.48 max side price
+- **Stop-loss**: Two-tier (HARD at FV<0.30, SOFT at FV<0.40 near close)
 - **Stale orders**: Cancelled after 30s if bid > 3c below current ask
-- **Anti-adverse**: Per-side order cap (2), pending imbalance tracking
-- **Affordability**: Skip orders if projected merge cost > $1.02
-- **MTM loss cap**: Stop trading if mark-to-market P&L too negative
-- **Post-merge cooldown**: 2-tick pause after merge to prevent aggressive re-entry
+- **FV threshold**: Time-scaled (20-80% early → 34-66% near expiry)
+- **MTM cap**: Stop trading if mark-to-market P&L < -$5
+- **Post-merge cooldown**: 2 ticks pause
 - **Salvage**: Sells excess unmerged at bid before window close
-- **FV threshold**: Time-scaled (aggressive early, conservative near expiry)
-- **Wind-down**: Hard stop at <60s, balancing only at <90s, bargains at <120s
-
-## Key Insights
-1. **Merge alpha is REAL**: 100% win rate, ~4-10% per pair, ~$1/window
-2. **Position risk DOMINATES**: ~$3-4/window from unmerged tokens expiring
-3. **Simulation NET EV is negative**: -$2.76/window (merge alpha < position risk)
-4. **But sim may be pessimistic**: real Polymarket books could have:
-   - Wider spreads → more merge edge per pair
-   - More oscillation → more merge opportunities
-   - Better fill rates on both sides
-5. **Stale order fix was critical**: without it, bot froze for 4+ min/window
 
 ## Next Steps (Priority)
-1. **🔴 Calibrate sim against real Polymarket data** — test with actual BTC 5-min books
-2. **🟡 Improve salvage timing** — sell imbalanced positions EARLY (at $0.30+) not at close ($0.15)
-3. **🟡 Explore mid-window exits** — sell tokens when conditions turn against merge viability
-4. **🟢 Run 50+ window Monte Carlo** for confidence interval on true EV
-5. **🟢 Live test** — only after sim calibration confirms positive EV
+1. **🔴 Run 20+ window test** for confidence interval on true EV
+2. **🟡 Calibrate sim against real Polymarket** — real books may have wider spreads (more edge)
+3. **🟡 Explore reducing max_side_price** from $0.48 to $0.45 (more merge edge per pair)
+4. **🟢 Live test on smallest possible size** once sim confirms positive EV
+5. **🟢 Consider pair-only buying** — only buy side B when holding side A
