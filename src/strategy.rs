@@ -332,6 +332,10 @@ impl MergeStrategy {
         let (up_pos, down_pos) = self.merge_engine.positions().await;
         let risk = self.risk_manager.read().await;
 
+        // Calculate unmerged share cost (these expire worthless at window close)
+        let unmerged_cost = up_pos.total_cost + down_pos.total_cost;
+        let net_pnl = pnl.total_profit - unmerged_cost;
+
         info!("╔══════════════════════════════════════╗");
         info!("║    WINDOW SUMMARY                    ║");
         info!("╠══════════════════════════════════════╣");
@@ -344,11 +348,13 @@ impl MergeStrategy {
             "║ Total invested: ${:.4} | Merged payout: ${:.4}",
             pnl.total_invested, pnl.total_merged_payout
         );
-        info!("║ Window profit: ${:.4}", pnl.total_profit);
+        info!("║ Merge profit: ${:.4}", pnl.total_profit);
         info!(
-            "║ Unmerged: {} Up + {} Down",
-            up_pos.shares, down_pos.shares
+            "║ Unmerged: {} Up (${:.4}) + {} Down (${:.4})",
+            up_pos.shares, up_pos.total_cost, down_pos.shares, down_pos.total_cost
         );
+        info!("║ Unmerged loss: -${:.4}", unmerged_cost);
+        info!("║ NET P&L: ${:.4}", net_pnl);
         info!("║ {}", risk.summary());
         info!("╚══════════════════════════════════════╝");
 
@@ -368,12 +374,50 @@ impl MergeStrategy {
         let (up_pos, down_pos) = self.merge_engine.positions().await;
         let open_orders = self.order_manager.open_order_count().await;
 
+        // Position balance: don't let one side get too far ahead.
+        // If we have 3x more of one side, stop buying it until the other catches up.
+        // This prevents massive unmerged positions at window close.
+        let max_imbalance_ratio = dec!(3.0);
+        let up_heavy = up_pos.shares > down_pos.shares * max_imbalance_ratio
+            && up_pos.shares > self.config.shares_per_order * dec!(2);
+        let down_heavy = down_pos.shares > up_pos.shares * max_imbalance_ratio
+            && down_pos.shares > self.config.shares_per_order * dec!(2);
+
+        if up_heavy {
+            debug!("Position imbalance: {} Up >> {} Down, pausing Up buys", up_pos.shares, down_pos.shares);
+        }
+        if down_heavy {
+            debug!("Position imbalance: {} Down >> {} Up, pausing Down buys", down_pos.shares, up_pos.shares);
+        }
+
         // Calculate target buy prices based on merge profitability
         // We want: up_price + down_price < 1.0 - target_edge
         let target_combined = Decimal::ONE - self.config.target_edge;
 
+        // Position imbalance check: don't let one side get too far ahead
+        let up_excess = up_pos.shares - down_pos.shares;
+        let down_excess = down_pos.shares - up_pos.shares;
+        let up_blocked = up_excess >= self.config.max_side_imbalance;
+        let down_blocked = down_excess >= self.config.max_side_imbalance;
+
+        if up_blocked {
+            debug!(
+                up = %up_pos.shares, down = %down_pos.shares,
+                max_imbalance = %self.config.max_side_imbalance,
+                "Skipping UP orders — position imbalance limit reached"
+            );
+        }
+        if down_blocked {
+            debug!(
+                up = %up_pos.shares, down = %down_pos.shares,
+                max_imbalance = %self.config.max_side_imbalance,
+                "Skipping DOWN orders — position imbalance limit reached"
+            );
+        }
+
         // === Evaluate buying Up tokens ===
         // When BTC is below opening price, Up tokens are cheaper → good time to buy
+        if !up_blocked {
         if let Some(up_ask) = snapshot.up_best_ask {
             let raw_bid = self.calculate_bid_price(
                 Side::Up,
@@ -402,7 +446,7 @@ impl MergeStrategy {
                 "Bid calculation"
             );
 
-            if self.should_buy(Side::Up, our_up_bid, up_ask, snapshot) {
+            if !up_heavy && self.should_buy(Side::Up, our_up_bid, up_ask, snapshot) {
                 let order_cost = self.config.shares_per_order * our_up_bid;
                 // Check risk THEN drop the read guard before potentially writing
                 let can_place = {
@@ -436,9 +480,11 @@ impl MergeStrategy {
                 }
             }
         }
+        } // end if !up_blocked
 
         // === Evaluate buying Down tokens ===
         // When BTC is above opening price, Down tokens are cheaper → good time to buy
+        if !down_blocked {
         if let Some(down_ask) = snapshot.down_best_ask {
             let raw_bid = self.calculate_bid_price(
                 Side::Down,
@@ -464,7 +510,7 @@ impl MergeStrategy {
                 "Bid calculation"
             );
 
-            if self.should_buy(Side::Down, our_down_bid, down_ask, snapshot) {
+            if !down_heavy && self.should_buy(Side::Down, our_down_bid, down_ask, snapshot) {
                 let order_cost = self.config.shares_per_order * our_down_bid;
                 let can_place = {
                     let risk = self.risk_manager.read().await;
@@ -497,6 +543,7 @@ impl MergeStrategy {
                 }
             }
         }
+        } // end if !down_blocked
 
         Ok(placed)
     }
@@ -518,11 +565,15 @@ impl MergeStrategy {
         let other_cost = if other_side_pos.shares > Decimal::ZERO {
             other_side_pos.avg_cost
         } else {
-            // Estimate from fair value of the other side
-            match side {
+            // Estimate from fair value of the other side, but use a conservative
+            // floor of 0.40. When BTC swings, the other side's fair value can be
+            // very low (e.g. 0.15), making us bid too high on this side. By assuming
+            // the other side will cost at least 0.40, we keep combined cost < $1.
+            let fv_other = match side {
                 Side::Up => snapshot.fair_value_down,
                 Side::Down => snapshot.fair_value_up,
-            }
+            };
+            fv_other.max(dec!(0.40))
         };
 
         // Our max bid = target_combined - other_side_cost

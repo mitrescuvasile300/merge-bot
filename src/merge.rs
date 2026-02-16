@@ -200,6 +200,10 @@ impl MergeEngine {
         }
         *self.up_position.write().await = Position::default();
         *self.down_position.write().await = Position::default();
+
+        // Increment markets_traded counter
+        let mut pnl = self.pnl.write().await;
+        pnl.markets_traded += 1;
     }
 
     /// Get merge history

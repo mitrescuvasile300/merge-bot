@@ -79,6 +79,9 @@ pub struct Config {
     pub max_side_price: Decimal,
     /// Min price to pay for any single side (ignore dust levels)
     pub min_side_price: Decimal,
+    /// Max shares of one side that can exceed the other side's position.
+    /// Prevents dangerous position imbalance (e.g., 280 Up vs 0 Down).
+    pub max_side_imbalance: Decimal,
 
     // === Risk ===
     pub daily_stop_loss_pct: Decimal,
@@ -132,6 +135,7 @@ impl Config {
             order_interval: Duration::from_secs(2), // Every 2 seconds
             max_side_price: dec!(0.65),  // Never pay more than 65c for one side
             min_side_price: dec!(0.01),  // Polymarket minimum tick (not used as bid floor anymore)
+            max_side_imbalance: dec!(60), // Max 60 shares ahead of the other side
 
             // Risk
             daily_stop_loss_pct: dec!(0.15),
