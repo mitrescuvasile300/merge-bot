@@ -195,6 +195,8 @@ pub struct PnlSnapshot {
     pub win_rate: Decimal,
     /// Revenue from selling excess unmerged shares before window close
     pub total_salvage_revenue: Decimal,
+    /// Cost basis of shares sold in salvage operations
+    pub total_salvage_cost_basis: Decimal,
     /// Number of shares sold in salvage operations
     pub total_salvage_shares: Decimal,
 }

@@ -220,6 +220,7 @@ impl MergeEngine {
         // better than losing cost_basis entirely. Track separately.
         let mut pnl = self.pnl.write().await;
         pnl.total_salvage_revenue += proceeds;
+        pnl.total_salvage_cost_basis += cost_basis;
         pnl.total_salvage_shares += sell_shares;
 
         let mode = if self.dry_run { "[DRY-RUN]" } else { "[LIVE]" };

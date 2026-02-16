@@ -417,8 +417,11 @@ impl MergeStrategy {
 
         // Calculate unmerged share cost (these expire worthless at window close)
         let unmerged_cost = up_pos.total_cost + down_pos.total_cost;
-        // NET P&L = merge profit + salvage revenue - remaining unmerged losses
-        let net_pnl = pnl.total_profit + pnl.total_salvage_revenue - unmerged_cost;
+        // Salvage loss = cost of salvaged shares - revenue received
+        let salvage_loss = pnl.total_salvage_cost_basis - pnl.total_salvage_revenue;
+        // NET P&L = merge profit - salvage loss - remaining unmerged losses
+        // This correctly reflects the TRUE window performance
+        let net_pnl = pnl.total_profit - salvage_loss - unmerged_cost;
 
         info!("╔══════════════════════════════════════╗");
         info!("║    WINDOW SUMMARY                    ║");
@@ -435,8 +438,9 @@ impl MergeStrategy {
         info!("║ Merge profit: ${:.4}", pnl.total_profit);
         if pnl.total_salvage_shares > Decimal::ZERO {
             info!(
-                "║ Salvage: {} shares sold for ${:.4}",
-                pnl.total_salvage_shares, pnl.total_salvage_revenue
+                "║ Salvage: {} shares | cost ${:.4} → sold for ${:.4} (loss: ${:.4})",
+                pnl.total_salvage_shares, pnl.total_salvage_cost_basis,
+                pnl.total_salvage_revenue, salvage_loss
             );
         }
         info!(
