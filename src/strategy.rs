@@ -251,13 +251,59 @@ impl MergeStrategy {
                 let down_mtm = down_pos.shares * snapshot.fair_value_down;
                 self.window_cash_pnl + up_mtm + down_mtm
             };
-            let mtm_blocked = mtm_pnl < dec!(-5);
+            let mtm_blocked = mtm_pnl < dec!(-3); // v13: tighter MTM loss cap ($3 vs $5)
             if mtm_blocked {
                 debug!(
                     mtm_pnl = %mtm_pnl,
                     cash_pnl = %self.window_cash_pnl,
                     "Window MTM loss cap reached — no new orders"
                 );
+
+                // v12: DYNAMIC STOP-LOSS — if MTM breaches cap AND we're in the
+                // second half of the window (remaining < 90s), sell one-sided
+                // position immediately instead of waiting for salvage phase.
+                // This cuts losses faster in directional windows.
+                const STOPLOSS_WINDOW_SECS: u64 = 90;
+                if snapshot.remaining_secs <= STOPLOSS_WINDOW_SECS {
+                    let (up_pos, down_pos) = self.merge_engine.positions().await;
+                    let excess_up = up_pos.shares.saturating_sub(down_pos.shares);
+                    let excess_down = down_pos.shares.saturating_sub(up_pos.shares);
+
+                    if excess_up > Decimal::ZERO {
+                        if let Some(up_bid) = snapshot.up_best_bid {
+                            let sell_price = up_bid.max(dec!(0.01));
+                            warn!(
+                                "STOPLOSS: Selling {} excess Up @ ${:.4} (MTM={:.2}, remaining={}s)",
+                                excess_up, sell_price, mtm_pnl, snapshot.remaining_secs
+                            );
+                            let proceeds = self.merge_engine
+                                .record_salvage(Side::Up, excess_up, sell_price)
+                                .await;
+                            if proceeds > Decimal::ZERO {
+                                self.risk_manager.write().await.record_salvage_revenue(proceeds);
+                                self.window_cash_pnl += proceeds;
+                            }
+                            // Cancel all pending orders
+                            self.order_manager.cancel_all().await?;
+                        }
+                    } else if excess_down > Decimal::ZERO {
+                        if let Some(down_bid) = snapshot.down_best_bid {
+                            let sell_price = down_bid.max(dec!(0.01));
+                            warn!(
+                                "STOPLOSS: Selling {} excess Down @ ${:.4} (MTM={:.2}, remaining={}s)",
+                                excess_down, sell_price, mtm_pnl, snapshot.remaining_secs
+                            );
+                            let proceeds = self.merge_engine
+                                .record_salvage(Side::Down, excess_down, sell_price)
+                                .await;
+                            if proceeds > Decimal::ZERO {
+                                self.risk_manager.write().await.record_salvage_revenue(proceeds);
+                                self.window_cash_pnl += proceeds;
+                            }
+                            self.order_manager.cancel_all().await?;
+                        }
+                    }
+                }
             }
 
             let cooldown_active = self.last_merge_tick > 0
@@ -721,11 +767,12 @@ impl MergeStrategy {
 
             // v11: Other-side affordability check.
             // If we already have Up tokens but no Down, check if Down's current
-            // ask would allow a profitable merge. If combined > $1.02, don't buy more Up.
+            // ask would allow a profitable merge. If combined > $1.05, don't buy more Up.
+            // v12: Relaxed from $1.02 to $1.05 — 5c buffer for BTC oscillation.
             let up_affordable = if up_pos.shares > Decimal::ZERO && down_pos.shares.is_zero() {
                 if let Some(down_ask_price) = snapshot.down_best_ask {
                     let projected = our_up_bid + down_ask_price;
-                    if projected > dec!(1.02) {
+                    if projected > dec!(1.05) {
                         debug!(
                             side = "UP",
                             our_bid = %our_up_bid,
@@ -808,11 +855,11 @@ impl MergeStrategy {
                 "Bid calculation"
             );
 
-            // v11: Other-side affordability check for Down side.
+            // v12: Other-side affordability check for Down side (relaxed to $1.05).
             let down_affordable = if down_pos.shares > Decimal::ZERO && up_pos.shares.is_zero() {
                 if let Some(up_ask_price) = snapshot.up_best_ask {
                     let projected = our_down_bid + up_ask_price;
-                    if projected > dec!(1.02) {
+                    if projected > dec!(1.05) {
                         debug!(
                             side = "DOWN",
                             our_bid = %our_down_bid,
