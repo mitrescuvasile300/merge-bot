@@ -726,16 +726,35 @@ impl MergeStrategy {
             return false;
         }
 
-        // v7: Softer FV filter (0.15/0.85, was 0.20/0.80).
-        // With realistic σ (~0.45), 0.20/0.80 blocked too many opportunities.
-        // The two-phase buying + max_side_price cap handles profitability.
-        if fair_value > dec!(0.85) || fair_value < dec!(0.15) {
-            debug!(
-                side = %side,
-                fv = %fair_value,
-                "Skipping: extreme fair value — merge would be unprofitable",
-            );
-            return false;
+        // v8: Time-scaled FV extreme threshold.
+        // Early in window: allow buying at extreme FV (time for BTC reversal).
+        // Late in window: stricter to avoid stranded positions.
+        // Window is 300s. time_fraction = remaining / 300.
+        // At full time: allow FV 0.05-0.95 (aggressive, time for reversal)
+        // At mid time:  allow FV ~0.10-0.90
+        // At end (60s):  allow FV ~0.17-0.83 (conservative)
+        {
+            let time_fraction = (snapshot.remaining_secs as f64 / 300.0).clamp(0.0, 1.0);
+            let min_fv_f64 = 0.05 + 0.15 * (1.0 - time_fraction);
+            let max_fv_f64 = 1.0 - min_fv_f64;
+            let min_fv = Decimal::from_f64_retain(min_fv_f64)
+                .unwrap_or(dec!(0.15))
+                .round_dp(4);
+            let max_fv = Decimal::from_f64_retain(max_fv_f64)
+                .unwrap_or(dec!(0.85))
+                .round_dp(4);
+            if fair_value > max_fv || fair_value < min_fv {
+                debug!(
+                    side = %side,
+                    fv = %fair_value,
+                    min_fv = %min_fv,
+                    max_fv = %max_fv,
+                    remaining = snapshot.remaining_secs,
+                    "Skipping: FV extreme for current time (need {}-{})",
+                    min_fv, max_fv,
+                );
+                return false;
+            }
         }
 
         // TIME-WEIGHTED WIND-DOWN: Graduated exit as window approaches close.
