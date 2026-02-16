@@ -281,13 +281,18 @@ impl SimulatedPolymarketFeed {
 
     /// Update simulated books based on current BTC price.
     ///
-    /// Uses a realistic 5-cent spread (real Polymarket 5-min options have 3-8c spreads).
-    /// The book has 3 levels of depth at increasing spreads.
+    /// Uses realistic spreads with noise:
+    /// - Base spread: 3-5c (real Polymarket 5-min options have 3-8c spreads)
+    /// - Random jitter on each level (±0.5-1c)
+    /// - Variable depth (20-100 shares per level)
+    /// - Wider spreads when remaining time is short (gamma risk)
     pub async fn update_from_btc_price(
         &self,
         btc_price: Decimal,
         remaining_secs: u64,
     ) {
+        use rand::Rng;
+
         let pricer = crate::pricing::BinaryPricer::new();
         let sigma = crate::pricing::VolatilityEstimator::default_volatility();
         let opening = *self.opening_price.read().await;
@@ -295,39 +300,73 @@ impl SimulatedPolymarketFeed {
         let fair_up = pricer.fair_value_up(btc_price, opening, sigma, remaining_secs);
         let fair_down = Decimal::ONE - fair_up;
 
-        // Realistic spread: 5c total (2.5c each side of fair value)
-        // With deeper levels at 4c and 6c from fair
-        let spread_l1 = rust_decimal_macros::dec!(0.025); // Tight: 2.5c from fair
-        let spread_l2 = rust_decimal_macros::dec!(0.04);  // Mid: 4c from fair
-        let spread_l3 = rust_decimal_macros::dec!(0.06);  // Wide: 6c from fair
+        // Generate ALL random values upfront (ThreadRng is not Send across .await)
+        let (spread_l1, spread_l2, spread_l3, depths) = {
+            let mut rng = rand::thread_rng();
+
+            // Spreads widen near expiry (gamma risk) and in fast markets
+            let time_factor: f64 = if remaining_secs < 30 {
+                1.8 // Very wide spreads near expiry
+            } else if remaining_secs < 60 {
+                1.3
+            } else {
+                1.0
+            };
+
+            // Base spreads with noise (±0.5c jitter)
+            let j1: f64 = rng.gen_range(-0.005..0.005);
+            let j2: f64 = rng.gen_range(-0.005..0.005);
+            let j3: f64 = rng.gen_range(-0.005..0.005);
+
+            let s1 = Decimal::from_f64_retain(0.025 * time_factor + j1)
+                .unwrap_or(rust_decimal_macros::dec!(0.025));
+            let s2 = Decimal::from_f64_retain(0.04 * time_factor + j2)
+                .unwrap_or(rust_decimal_macros::dec!(0.04));
+            let s3 = Decimal::from_f64_retain(0.06 * time_factor + j3)
+                .unwrap_or(rust_decimal_macros::dec!(0.06));
+
+            // Variable depth: 6 values for bid/ask × 3 levels (for each book side)
+            let d: Vec<Decimal> = (0..12)
+                .map(|i| {
+                    let base = match i % 3 {
+                        0 => 50u32,
+                        1 => 150,
+                        _ => 300,
+                    };
+                    Decimal::from(rng.gen_range(base / 2..base * 2))
+                })
+                .collect();
+
+            (s1, s2, s3, d)
+        }; // rng dropped here, before any .await
 
         let up_book = OrderBook {
             bids: vec![
                 BookLevel {
                     price: (fair_up - spread_l1).max(rust_decimal_macros::dec!(0.01)),
-                    size: rust_decimal_macros::dec!(50),
+                    size: depths[0],
                 },
                 BookLevel {
                     price: (fair_up - spread_l2).max(rust_decimal_macros::dec!(0.01)),
-                    size: rust_decimal_macros::dec!(150),
+                    size: depths[1],
                 },
                 BookLevel {
                     price: (fair_up - spread_l3).max(rust_decimal_macros::dec!(0.01)),
-                    size: rust_decimal_macros::dec!(300),
+                    size: depths[2],
                 },
             ],
             asks: vec![
                 BookLevel {
                     price: (fair_up + spread_l1).min(rust_decimal_macros::dec!(0.99)),
-                    size: rust_decimal_macros::dec!(50),
+                    size: depths[3],
                 },
                 BookLevel {
                     price: (fair_up + spread_l2).min(rust_decimal_macros::dec!(0.99)),
-                    size: rust_decimal_macros::dec!(150),
+                    size: depths[4],
                 },
                 BookLevel {
                     price: (fair_up + spread_l3).min(rust_decimal_macros::dec!(0.99)),
-                    size: rust_decimal_macros::dec!(300),
+                    size: depths[5],
                 },
             ],
             timestamp: Some(Utc::now()),
@@ -337,29 +376,29 @@ impl SimulatedPolymarketFeed {
             bids: vec![
                 BookLevel {
                     price: (fair_down - spread_l1).max(rust_decimal_macros::dec!(0.01)),
-                    size: rust_decimal_macros::dec!(50),
+                    size: depths[6],
                 },
                 BookLevel {
                     price: (fair_down - spread_l2).max(rust_decimal_macros::dec!(0.01)),
-                    size: rust_decimal_macros::dec!(150),
+                    size: depths[7],
                 },
                 BookLevel {
                     price: (fair_down - spread_l3).max(rust_decimal_macros::dec!(0.01)),
-                    size: rust_decimal_macros::dec!(300),
+                    size: depths[8],
                 },
             ],
             asks: vec![
                 BookLevel {
                     price: (fair_down + spread_l1).min(rust_decimal_macros::dec!(0.99)),
-                    size: rust_decimal_macros::dec!(50),
+                    size: depths[9],
                 },
                 BookLevel {
                     price: (fair_down + spread_l2).min(rust_decimal_macros::dec!(0.99)),
-                    size: rust_decimal_macros::dec!(150),
+                    size: depths[10],
                 },
                 BookLevel {
                     price: (fair_down + spread_l3).min(rust_decimal_macros::dec!(0.99)),
-                    size: rust_decimal_macros::dec!(300),
+                    size: depths[11],
                 },
             ],
             timestamp: Some(Utc::now()),

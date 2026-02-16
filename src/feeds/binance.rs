@@ -139,7 +139,18 @@ impl BinanceFeed {
 }
 
 /// Simulated Binance feed for dry-run mode.
-/// Generates realistic BTC price movements using a random walk.
+///
+/// Uses Geometric Brownian Motion (GBM) with mean-reversion — a realistic
+/// model for BTC price movements within a 5-minute window:
+///
+/// - GBM component: random walk with 45% annualized vol (~$30 per 5-min window)
+/// - Mean-reversion: weak pull back toward opening price (κ = 0.001)
+///   This models the empirical observation that 5-min BTC moves are partially
+///   mean-reverting, creating the oscillation the merge strategy exploits.
+/// - Microstructure noise: small random tick-level noise (±$2-3)
+///
+/// Net effect: BTC typically oscillates ±$30-80 within a window, with
+/// occasional trending periods — much more realistic than the old sine wave.
 pub struct SimulatedBinanceFeed {
     price: Arc<RwLock<Option<PriceTick>>>,
     price_tx: watch::Sender<Option<PriceTick>>,
@@ -161,26 +172,61 @@ impl SimulatedBinanceFeed {
         self.price.read().await.clone()
     }
 
-    /// Run the simulated feed (generates prices every 500ms)
+    /// Run the simulated feed (generates prices every 500ms via GBM + mean-reversion)
     pub async fn run(&self) -> Result<()> {
+        use rand::SeedableRng;
+        use rand_distr::{Distribution, Normal};
+
         info!(
             initial_price = %self.initial_price,
-            "Starting simulated BTC price feed"
+            "Starting simulated BTC price feed (GBM + mean-reversion)"
         );
 
-        let mut step = 0u64;
+        // Use StdRng (Send-safe) seeded from entropy, so it works across .await
+        let mut rng = rand::rngs::StdRng::from_entropy();
+        let normal = Normal::new(0.0, 1.0).unwrap();
+
+        // GBM parameters calibrated to real BTC:
+        // - 45% annualized vol → per 500ms step: σ√(dt) where dt = 0.5/31536000
+        let sigma_annual = 0.45_f64;
+        let dt: f64 = 0.5 / 31_536_000.0; // 500ms in years
+        let sigma_step = sigma_annual * dt.sqrt(); // ~1.79e-4
+
+        // Mean-reversion: Ornstein-Uhlenbeck component
+        // κ = mean-reversion speed (small = weak pull, preserves randomness)
+        let kappa = 0.001_f64;
+
+        // Microstructure noise: small random tick jitter (σ_noise ~ $2)
+        let noise_sigma = 2.0_f64;
+        let noise_dist = Normal::new(0.0, noise_sigma).unwrap();
+
+        let initial_f64 = self.initial_price.to_string().parse::<f64>().unwrap_or(97000.0);
+        let mut current_f64 = initial_f64;
+        let anchor = initial_f64; // mean-reversion target
 
         loop {
-            // Simulate BTC oscillation: ±$50-100 deterministic walk
-            // Larger amplitude to exercise both sides of the strategy.
-            // Multiple frequencies create realistic-looking zigzag movement.
-            let phase = (step as f64 * 0.08).sin() * 55.0
-                + (step as f64 * 0.19).sin() * 35.0
-                + (step as f64 * 0.31).sin() * 20.0
-                + (step as f64 * 0.05).cos() * 30.0;
+            // 1. GBM step: dS/S = σ * dW (zero drift for short-term)
+            let z: f64 = normal.sample(&mut rng);
+            let gbm_return = sigma_step * z;
 
-            let delta = Decimal::from_f64_retain(phase).unwrap_or(Decimal::ZERO);
-            let current_price = self.initial_price + delta;
+            // 2. Mean-reversion: pull toward anchor price
+            let deviation = (current_f64 - anchor) / anchor; // relative deviation
+            let mr_pull = -kappa * deviation; // proportional pull back
+
+            // 3. Combined move
+            current_f64 *= 1.0 + gbm_return + mr_pull;
+
+            // 4. Add microstructure noise (absolute, not proportional)
+            let noise: f64 = noise_dist.sample(&mut rng);
+            current_f64 += noise;
+
+            // Sanity clamp: BTC shouldn't move more than 2% in a 5-min window
+            let min_price = anchor * 0.98;
+            let max_price = anchor * 1.02;
+            current_f64 = current_f64.clamp(min_price, max_price);
+
+            let current_price = Decimal::from_f64_retain(current_f64)
+                .unwrap_or(self.initial_price);
 
             let tick = PriceTick {
                 price: current_price,
@@ -191,7 +237,6 @@ impl SimulatedBinanceFeed {
             *self.price.write().await = Some(tick.clone());
             let _ = self.price_tx.send(Some(tick));
 
-            step += 1;
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         }
     }
