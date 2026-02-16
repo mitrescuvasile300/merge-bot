@@ -1,0 +1,459 @@
+//! Core merge arbitrage strategy loop.
+//!
+//! Implements the MuseumOfBees strategy:
+//! 1. Wait ~90 seconds after market opens for price to establish
+//! 2. Monitor BTC price oscillations within the 5-min window
+//! 3. Buy Up tokens when BTC dips (Up tokens cheap)
+//! 4. Buy Down tokens when BTC rises (Down tokens cheap)
+//! 5. Combined cost of Up + Down < $1 → profit on merge
+//! 6. Use LIMIT orders (maker = 0 fees + rebates)
+
+use anyhow::Result;
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use tracing::{debug, info, warn};
+
+use crate::config::Config;
+use crate::feeds::polymarket::MarketBooks;
+use crate::merge::MergeEngine;
+use crate::orders::OrderManager;
+use crate::pricing::{BinaryPricer, VolatilityEstimator};
+use crate::risk::RiskManager;
+use crate::types::{Market, PriceTick, Side};
+
+/// The merge arbitrage strategy
+pub struct MergeStrategy {
+    config: Config,
+    pricer: BinaryPricer,
+    vol_estimator: VolatilityEstimator,
+    order_manager: Arc<OrderManager>,
+    merge_engine: Arc<MergeEngine>,
+    risk_manager: Arc<RwLock<RiskManager>>,
+}
+
+/// Snapshot of the current market state for decision making
+#[derive(Debug)]
+struct MarketSnapshot {
+    btc_price: Decimal,
+    opening_price: Decimal,
+    remaining_secs: u64,
+    up_best_ask: Option<Decimal>,
+    down_best_ask: Option<Decimal>,
+    up_best_bid: Option<Decimal>,
+    down_best_bid: Option<Decimal>,
+    fair_value_up: Decimal,
+    fair_value_down: Decimal,
+    sigma: Decimal,
+}
+
+impl MergeStrategy {
+    pub fn new(
+        config: Config,
+        order_manager: Arc<OrderManager>,
+        merge_engine: Arc<MergeEngine>,
+        risk_manager: Arc<RwLock<RiskManager>>,
+    ) -> Self {
+        Self {
+            config,
+            pricer: BinaryPricer::new(),
+            vol_estimator: VolatilityEstimator::new(200),
+            order_manager,
+            merge_engine,
+            risk_manager,
+        }
+    }
+
+    /// Run the strategy for one 5-minute market window.
+    /// Returns the number of merge pairs completed.
+    pub async fn run_window(
+        &mut self,
+        market: &Market,
+        btc_price_fn: impl Fn() -> Option<PriceTick>,
+        books: Arc<RwLock<MarketBooks>>,
+    ) -> Result<u64> {
+        let mode = if self.config.dry_run {
+            "[DRY-RUN]"
+        } else {
+            "[LIVE]"
+        };
+
+        info!(
+            "{} Starting strategy for market {} (window {}–{})",
+            mode, market.slug, market.window_start, market.window_end
+        );
+
+        // Phase 1: Wait for entry delay (let market establish)
+        let elapsed = market.seconds_elapsed();
+        if elapsed < self.config.entry_delay_secs {
+            let wait = self.config.entry_delay_secs - elapsed;
+            info!(
+                "Waiting {} seconds for market to establish (entry delay: {}s)",
+                wait, self.config.entry_delay_secs
+            );
+            tokio::time::sleep(tokio::time::Duration::from_secs(wait)).await;
+        }
+
+        // Capture opening price from first BTC tick
+        let opening_price = if let Some(op) = market.opening_price {
+            op
+        } else if let Some(tick) = btc_price_fn() {
+            tick.price
+        } else {
+            warn!("No BTC price available, skipping window");
+            return Ok(0);
+        };
+
+        info!(
+            "BTC opening price for window: ${:.2}",
+            opening_price
+        );
+
+        // Reset merge engine for new window
+        self.merge_engine.reset_for_new_window().await;
+        self.risk_manager.write().await.reset_market_exposure();
+
+        let mut total_orders = 0u64;
+        let mut last_order_time = std::time::Instant::now();
+
+        // Phase 2: Active trading loop
+        loop {
+            let remaining = market.seconds_remaining();
+
+            // Stop trading before window close
+            if remaining <= self.config.exit_buffer_secs as i64 {
+                info!(
+                    "Exit buffer reached ({} secs remaining), stopping orders",
+                    remaining
+                );
+                break;
+            }
+
+            // Rate limit: wait between orders
+            let since_last = last_order_time.elapsed();
+            if since_last < self.config.order_interval {
+                let wait = self.config.order_interval - since_last;
+                tokio::time::sleep(wait).await;
+            }
+
+            // Get current BTC price
+            let btc_tick = match btc_price_fn() {
+                Some(tick) => tick,
+                None => {
+                    debug!("No BTC price, waiting...");
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    continue;
+                }
+            };
+
+            // Feed volatility estimator
+            self.vol_estimator.add_price(
+                btc_tick.timestamp.timestamp() as u64,
+                crate::pricing::decimal_to_f64_pub(btc_tick.price),
+            );
+
+            // Build market snapshot
+            let snapshot = {
+                let book_state = books.read().await;
+                let sigma = self
+                    .vol_estimator
+                    .annualized_volatility()
+                    .unwrap_or(VolatilityEstimator::default_volatility());
+
+                let fair_up = self.pricer.fair_value_up(
+                    btc_tick.price,
+                    opening_price,
+                    sigma,
+                    remaining as u64,
+                );
+
+                MarketSnapshot {
+                    btc_price: btc_tick.price,
+                    opening_price,
+                    remaining_secs: remaining as u64,
+                    up_best_ask: book_state.up_book.best_ask(),
+                    down_best_ask: book_state.down_book.best_ask(),
+                    up_best_bid: book_state.up_book.best_bid(),
+                    down_best_bid: book_state.down_book.best_bid(),
+                    fair_value_up: fair_up,
+                    fair_value_down: Decimal::ONE - fair_up,
+                    sigma,
+                }
+            };
+
+            debug!(
+                btc = %snapshot.btc_price,
+                fv_up = %snapshot.fair_value_up,
+                fv_down = %snapshot.fair_value_down,
+                remaining = snapshot.remaining_secs,
+                "Market snapshot"
+            );
+
+            // Check risk limits
+            if self.risk_manager.read().await.is_halted() {
+                warn!("Risk manager halted trading");
+                break;
+            }
+
+            // Try to place orders on each side
+            let placed = self.evaluate_and_place_orders(market, &snapshot).await?;
+            if placed > 0 {
+                total_orders += placed;
+                last_order_time = std::time::Instant::now();
+            }
+
+            // In dry-run mode, simulate fills
+            if self.config.dry_run {
+                let book_state = books.read().await;
+                let up_fills = self
+                    .order_manager
+                    .simulate_fills(&book_state.up_book, &market.up_token_id)
+                    .await;
+                let down_fills = self
+                    .order_manager
+                    .simulate_fills(&book_state.down_book, &market.down_token_id)
+                    .await;
+
+                // Record fills in merge engine
+                for fill_id in &up_fills {
+                    let orders = self.order_manager.all_orders().await;
+                    if let Some(order) = orders.iter().find(|o| &o.id == fill_id) {
+                        self.merge_engine
+                            .record_fill(Side::Up, order.filled, order.price)
+                            .await;
+                    }
+                }
+                for fill_id in &down_fills {
+                    let orders = self.order_manager.all_orders().await;
+                    if let Some(order) = orders.iter().find(|o| &o.id == fill_id) {
+                        self.merge_engine
+                            .record_fill(Side::Down, order.filled, order.price)
+                            .await;
+                    }
+                }
+            }
+
+            // Try to merge any available pairs
+            if let Some(merge_result) = self.merge_engine.try_merge().await {
+                let mut risk = self.risk_manager.write().await;
+                risk.record_merge(merge_result.profit, merge_result.total_cost);
+            }
+        }
+
+        // Phase 3: End of window — final merge attempt
+        if let Some(merge_result) = self.merge_engine.try_merge().await {
+            let mut risk = self.risk_manager.write().await;
+            risk.record_merge(merge_result.profit, merge_result.total_cost);
+        }
+
+        // Cancel any remaining open orders
+        let cancelled = self.order_manager.cancel_all().await?;
+        if cancelled > 0 {
+            info!("Cancelled {} remaining open orders at window close", cancelled);
+        }
+
+        // Report results
+        let pnl = self.merge_engine.pnl_snapshot().await;
+        let (up_pos, down_pos) = self.merge_engine.positions().await;
+        let risk = self.risk_manager.read().await;
+
+        info!("╔══════════════════════════════════════╗");
+        info!("║    WINDOW SUMMARY                    ║");
+        info!("╠══════════════════════════════════════╣");
+        info!("║ {} Market: {}", mode, market.slug);
+        info!(
+            "║ Orders placed: {} | Merges: {} | Pairs: {}",
+            total_orders, pnl.total_merges, pnl.total_pairs
+        );
+        info!(
+            "║ Total invested: ${:.4} | Merged payout: ${:.4}",
+            pnl.total_invested, pnl.total_merged_payout
+        );
+        info!("║ Window profit: ${:.4}", pnl.total_profit);
+        info!(
+            "║ Unmerged: {} Up + {} Down",
+            up_pos.shares, down_pos.shares
+        );
+        info!("║ {}", risk.summary());
+        info!("╚══════════════════════════════════════╝");
+
+        Ok(pnl.total_merges)
+    }
+
+    /// Evaluate current market conditions and place orders if favorable.
+    /// Returns the number of orders placed.
+    async fn evaluate_and_place_orders(
+        &self,
+        market: &Market,
+        snapshot: &MarketSnapshot,
+    ) -> Result<u64> {
+        let mut placed = 0u64;
+
+        // Get current positions
+        let (up_pos, down_pos) = self.merge_engine.positions().await;
+        let open_orders = self.order_manager.open_order_count().await;
+
+        // Calculate target buy prices based on merge profitability
+        // We want: up_price + down_price < 1.0 - target_edge
+        // Strategy: use the opposite side's current best ask as reference
+        let target_combined = Decimal::ONE - self.config.target_edge;
+
+        // === Evaluate buying Up tokens ===
+        // When BTC is below opening price, Up tokens are cheaper → good time to buy
+        if let Some(up_ask) = snapshot.up_best_ask {
+            let our_up_bid = self.calculate_bid_price(
+                Side::Up,
+                snapshot,
+                &down_pos,
+                target_combined,
+            );
+
+            if self.should_buy(Side::Up, our_up_bid, up_ask, snapshot) {
+                let order_cost = self.config.shares_per_order * our_up_bid;
+                let risk = self.risk_manager.read().await;
+
+                if risk.can_place_order(order_cost, open_orders).is_ok() {
+                    match self
+                        .order_manager
+                        .place_limit_buy(
+                            &market.condition_id,
+                            &market.up_token_id,
+                            Side::Up,
+                            our_up_bid,
+                            self.config.shares_per_order,
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            self.risk_manager.write().await.record_order(order_cost);
+                            placed += 1;
+                        }
+                        Err(e) => debug!("Failed to place Up order: {:?}", e),
+                    }
+                }
+            }
+        }
+
+        // === Evaluate buying Down tokens ===
+        // When BTC is above opening price, Down tokens are cheaper → good time to buy
+        if let Some(down_ask) = snapshot.down_best_ask {
+            let our_down_bid = self.calculate_bid_price(
+                Side::Down,
+                snapshot,
+                &up_pos,
+                target_combined,
+            );
+
+            if self.should_buy(Side::Down, our_down_bid, down_ask, snapshot) {
+                let order_cost = self.config.shares_per_order * our_down_bid;
+                let risk = self.risk_manager.read().await;
+
+                if risk.can_place_order(order_cost, open_orders + placed as usize).is_ok() {
+                    match self
+                        .order_manager
+                        .place_limit_buy(
+                            &market.condition_id,
+                            &market.down_token_id,
+                            Side::Down,
+                            our_down_bid,
+                            self.config.shares_per_order,
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            self.risk_manager.write().await.record_order(order_cost);
+                            placed += 1;
+                        }
+                        Err(e) => debug!("Failed to place Down order: {:?}", e),
+                    }
+                }
+            }
+        }
+
+        Ok(placed)
+    }
+
+    /// Calculate our limit bid price for a side, given the other side's position
+    fn calculate_bid_price(
+        &self,
+        side: Side,
+        snapshot: &MarketSnapshot,
+        other_side_pos: &crate::types::Position,
+        target_combined: Decimal,
+    ) -> Decimal {
+        let fair_value = match side {
+            Side::Up => snapshot.fair_value_up,
+            Side::Down => snapshot.fair_value_down,
+        };
+
+        // If we already have the other side, use our actual avg cost
+        let other_cost = if other_side_pos.shares > Decimal::ZERO {
+            other_side_pos.avg_cost
+        } else {
+            // Estimate from fair value of the other side
+            match side {
+                Side::Up => snapshot.fair_value_down,
+                Side::Down => snapshot.fair_value_up,
+            }
+        };
+
+        // Our max bid = target_combined - other_side_cost
+        let max_bid = target_combined - other_cost;
+
+        // Don't bid above fair value (we want edge)
+        let bid = max_bid.min(fair_value);
+
+        // Clamp to configured bounds
+        bid.max(self.config.min_side_price)
+            .min(self.config.max_side_price)
+    }
+
+    /// Determine if we should place a buy order for this side
+    fn should_buy(
+        &self,
+        side: Side,
+        our_bid: Decimal,
+        market_ask: Decimal,
+        snapshot: &MarketSnapshot,
+    ) -> bool {
+        // Basic validity checks
+        if our_bid < self.config.min_side_price || our_bid > self.config.max_side_price {
+            return false;
+        }
+
+        // Only buy if our bid is competitive (at or near the ask)
+        // For maker orders, we post below the ask to get filled when price comes to us
+        let price_ok = our_bid <= market_ask + dec!(0.02);
+
+        // Directional filter: prefer buying when this side is cheap
+        let btc_delta = snapshot.btc_price - snapshot.opening_price;
+        let directional_ok = match side {
+            // Buy Up when BTC is dipping (Up tokens cheaper)
+            Side::Up => btc_delta <= dec!(0),
+            // Buy Down when BTC is rising (Down tokens cheaper)
+            Side::Down => btc_delta >= dec!(0),
+        };
+
+        // Price must be in reasonable range
+        let fair_value = match side {
+            Side::Up => snapshot.fair_value_up,
+            Side::Down => snapshot.fair_value_down,
+        };
+        let value_ok = our_bid <= fair_value + dec!(0.02);
+
+        // Don't buy if the side is too expensive (price > 55c means other side < 45c)
+        let cheap_enough = market_ask <= self.config.max_side_price;
+
+        price_ok && (directional_ok || our_bid < fair_value - dec!(0.02)) && value_ok && cheap_enough
+    }
+}
+
+// Helper to expose decimal_to_f64 for strategy
+impl crate::pricing::VolatilityEstimator {
+    pub fn add_price_from_tick(&mut self, tick: &PriceTick) {
+        let ts = tick.timestamp.timestamp() as u64;
+        let price = crate::pricing::decimal_to_f64_pub(tick.price);
+        self.add_price(ts, price);
+    }
+}

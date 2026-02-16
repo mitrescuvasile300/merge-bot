@@ -1,0 +1,163 @@
+use clap::Parser;
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
+use std::time::Duration;
+
+/// Polymarket BTC 5-min merge arbitrage bot
+#[derive(Parser, Debug, Clone)]
+#[command(name = "merge-bot", about = "Polymarket BTC 5-min merge arbitrage bot")]
+pub struct CliArgs {
+    /// Run in dry-run mode (paper trading, no real transactions)
+    #[arg(long, default_value_t = true)]
+    pub dry_run: bool,
+
+    /// Run in LIVE mode (real transactions — use with caution!)
+    #[arg(long, default_value_t = false)]
+    pub live: bool,
+
+    /// Initial capital in USDC
+    #[arg(long, default_value_t = 215.0)]
+    pub capital: f64,
+
+    /// Log level (trace, debug, info, warn, error)
+    #[arg(long, default_value = "info")]
+    pub log_level: String,
+
+    /// Number of market windows to trade (0 = unlimited)
+    #[arg(long, default_value_t = 0)]
+    pub max_windows: u64,
+
+    /// Target edge per merge pair (combined cost below $1 by this amount)
+    #[arg(long, default_value_t = 0.03)]
+    pub target_edge: f64,
+
+    /// Shares per order
+    #[arg(long, default_value_t = 20)]
+    pub shares_per_order: u64,
+
+    /// Output JSON logs
+    #[arg(long, default_value_t = false)]
+    pub json_logs: bool,
+}
+
+/// Full bot configuration derived from CLI args + env vars
+#[derive(Debug, Clone)]
+pub struct Config {
+    // === Mode ===
+    pub dry_run: bool,
+
+    // === Capital ===
+    pub initial_capital: Decimal,
+    pub max_position_pct: Decimal,
+
+    // === Strategy ===
+    /// Target edge per pair (how much below $1 we aim for combined cost)
+    pub target_edge: Decimal,
+    /// Shares per individual order
+    pub shares_per_order: Decimal,
+    /// Minimum order size (Polymarket minimum is 5 shares)
+    pub min_order_shares: Decimal,
+    /// Delay after window opens before starting (seconds)
+    pub entry_delay_secs: u64,
+    /// Stop trading this many seconds before window close
+    pub exit_buffer_secs: u64,
+    /// Interval between order placement attempts
+    pub order_interval: Duration,
+    /// Max price to pay for any single side (never buy above this)
+    pub max_side_price: Decimal,
+    /// Min price to pay for any single side (ignore dust levels)
+    pub min_side_price: Decimal,
+
+    // === Risk ===
+    pub daily_stop_loss_pct: Decimal,
+    pub consecutive_loss_limit: u32,
+    pub max_open_orders: usize,
+    pub max_exposure_per_market: Decimal,
+
+    // === API Credentials (live mode only) ===
+    pub polymarket_api_key: Option<String>,
+    pub polymarket_api_secret: Option<String>,
+    pub polymarket_passphrase: Option<String>,
+    pub polygon_private_key: Option<String>,
+
+    // === Endpoints ===
+    pub clob_url: String,
+    pub gamma_url: String,
+    pub clob_ws_url: String,
+    pub binance_ws_url: String,
+
+    // === Limits ===
+    pub max_windows: u64,
+    pub json_logs: bool,
+}
+
+impl Config {
+    pub fn from_args(args: &CliArgs) -> Self {
+        // Live mode requires --live flag AND dry_run must be explicitly disabled
+        let dry_run = !args.live;
+
+        // Load env vars for live mode credentials
+        let _ = dotenvy::dotenv();
+
+        Config {
+            dry_run,
+
+            // Capital
+            initial_capital: Decimal::from_f64_retain(args.capital)
+                .unwrap_or(dec!(215.0)),
+            max_position_pct: dec!(0.10),
+
+            // Strategy — tuned to MuseumOfBees parameters
+            target_edge: Decimal::from_f64_retain(args.target_edge)
+                .unwrap_or(dec!(0.03)),
+            shares_per_order: Decimal::from(args.shares_per_order),
+            min_order_shares: dec!(5),
+            entry_delay_secs: 90,    // Start ~90s after window opens
+            exit_buffer_secs: 30,    // Stop 30s before close
+            order_interval: Duration::from_secs(3), // Every 2-5 seconds
+            max_side_price: dec!(0.55),  // Never pay more than 55c for one side
+            min_side_price: dec!(0.35),  // Ignore if price below 35c (too directional)
+
+            // Risk
+            daily_stop_loss_pct: dec!(0.15),
+            consecutive_loss_limit: 5,
+            max_open_orders: 10,
+            max_exposure_per_market: dec!(50.0), // Max $50 per market window
+
+            // API Credentials
+            polymarket_api_key: std::env::var("POLYMARKET_API_KEY").ok(),
+            polymarket_api_secret: std::env::var("POLYMARKET_API_SECRET").ok(),
+            polymarket_passphrase: std::env::var("POLYMARKET_PASSPHRASE").ok(),
+            polygon_private_key: std::env::var("POLYGON_PRIVATE_KEY").ok(),
+
+            // Endpoints
+            clob_url: "https://clob.polymarket.com".to_string(),
+            gamma_url: "https://gamma-api.polymarket.com".to_string(),
+            clob_ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market".to_string(),
+            binance_ws_url: "wss://stream.binance.com:9443/ws/btcusdt@trade".to_string(),
+
+            // Limits
+            max_windows: args.max_windows,
+            json_logs: args.json_logs,
+        }
+    }
+
+    /// Validate that live mode has all required credentials
+    pub fn validate_live_mode(&self) -> anyhow::Result<()> {
+        if !self.dry_run {
+            if self.polymarket_api_key.is_none() {
+                anyhow::bail!("POLYMARKET_API_KEY required for live trading");
+            }
+            if self.polymarket_api_secret.is_none() {
+                anyhow::bail!("POLYMARKET_API_SECRET required for live trading");
+            }
+            if self.polymarket_passphrase.is_none() {
+                anyhow::bail!("POLYMARKET_PASSPHRASE required for live trading");
+            }
+            if self.polygon_private_key.is_none() {
+                anyhow::bail!("POLYGON_PRIVATE_KEY required for live trading");
+            }
+        }
+        Ok(())
+    }
+}

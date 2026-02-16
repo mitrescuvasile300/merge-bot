@@ -1,0 +1,58 @@
+[package]
+name = "merge-bot"
+version = "0.1.0"
+edition = "2021"
+description = "Polymarket BTC 5-minute binary options merge arbitrage bot"
+license = "MIT"
+
+[[bin]]
+name = "merge-bot"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
+
+# HTTP + WebSocket
+reqwest = { version = "0.12", features = ["json"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Precise decimal math (critical for financial calculations)
+rust_decimal = { version = "1.36", features = ["serde-with-str"] }
+rust_decimal_macros = "1.36"
+
+# Statistics (Normal distribution CDF for Black-Scholes)
+statrs = "0.17"
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Configuration
+dotenvy = "0.15"
+clap = { version = "4", features = ["derive"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Crypto signing (for live mode)
+alloy = { version = "1", features = ["signer-local"] }
+hex = "0.4"
+
+# UUID for order IDs
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
