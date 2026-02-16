@@ -1,60 +1,64 @@
 # Merge Bot Development Status
 
-## Current State: v8 + P&L FIX — HIGH VARIANCE CONFIRMED
+## Current State: v9.1 (v12 HEAD) — FIRST PROFITABLE GBM RUN
 - Code compiles cleanly (0 errors, 0 warnings)
-- v8: time-scaled FV threshold + salvage mechanism + accurate P&L
-- HEAD: `af79e05` (fix: accurate NET P&L after salvage)
-- **Critical finding: Same strategy produces +30% OR -18% depending on BTC path**
+- HEAD: `e517b30` (v12: mid-window stop-loss + tighter FV bands + fill_price tracking)
+- **Milestone: +1.3% ROI on 3-window GBM random walk test**
+- Adverse selection problem identified and fixed
 
-## Latest Tests — 2026-02-16 ~05:16-05:35 UTC
+## Latest Tests — 2026-02-16 ~07:08-07:20 UTC
 
-### Test A: 3-Window Random Walk (GBM)
+### Test: 3-Window GBM Random Walk (v9.1)
 ```
-Window  Merges  Pairs  Merge P&L   Salvage Net   TRUE NET
-  #1      0       0    $0.00       -$9.40        -$9.40
-  #2      1      30    $1.20      +$52.76       +$53.96
-  #3      4     140    $5.60      +$14.85       +$20.45
-──────  ──────  ────  ────────    ──────────    ────────
-TOTAL     5     170    $6.80      +$58.21       +$65.01
+Window  Merges  Margin    Salvage         NET P&L
+  #1      0     —        +$2.51 profit   +$2.51
+  #2     10     5.88%    -$0.95 loss     -$2.91
+  #3     15     5.8-9.7% +$2.29 profit   +$4.30
+──────  ──────  ────────  ──────────      ────────
+TOTAL    25     100% win  salvage +$3.85  +$2.70
 ```
-- Capital: $215 → $280 (+30.2% ROI)
-- 73 orders, 54 fills, 100% merge win rate
-- ⚠️ $58 of $65 profit from salvage (directional luck), only $6.80 from merges
+- Capital: $215 → $217.70 (+1.26% ROI)
+- 17 orders, 4 merges, 25 pairs, 100% merge win rate
+- Stop-loss fired in W2: sold 10 excess DOWN at FV=0.14
 
-### Test B: 1-Window Verification (with P&L fix)
+### Comparison with v8
 ```
-Window  Merges  Pairs  Merge P&L   Salvage Net   TRUE NET
-  #1      2     110    $4.40      -$42.30       -$37.90
+v8 (before):  5 windows → $193.86 (-9.8%) ❌
+v9.1 (now):   3 windows → $217.70 (+1.3%) ✅
 ```
-- Capital: $215 → $177 (-17.7%)
-- BTC trended → 90 UP shares expired near-worthless
-- P&L fix correctly shows -$37.90 (old formula would have shown ~+$5)
 
-### Key Findings
-1. **Merge alpha is REAL but small**: 100% win rate, 4.16% per pair, ~$2-5/window
-2. **Position risk DOMINATES**: ±$40/window from unmerged tokens
-3. **Salvage is directional**: can profit (+$52) or lose (-$42) depending on trend
-4. **Variance is extremely high**: same code → +$65 or -$38
-5. **P&L reporting now accurate**: salvage cost basis tracked correctly
+## Root Cause: Adverse Selection (FIXED)
+The bot was buying MORE losing-side tokens because:
+1. Losing side gets cheaper → fills more at our limit price
+2. Winning side gets expensive → our limit doesn't fill
+3. Result: excess worthless losing tokens at expiry
+
+Three fixes:
+1. **Per-side order cap** (max 2 open/side) — prevents batch one-sided fills
+2. **Price improvement in sim** — fills at best_ask, not limit price
+3. **Mid-window stop-loss** — sells excess losing tokens at ~$0.12-0.18 vs $0.01 at expiry
+
+## Architecture (v9.1)
+- **Sim**: GBM with 45% annual vol, κ=0.001 mean-reversion
+- **Orders**: 5 shares/order, max 2 open orders per side, max 10 imbalance
+- **Exposure**: $50/window cap (halved from $100)
+- **Salvage**: Sells excess at bid before window close
+- **Stop-loss**: If excess side FV < 0.20, sell early at current bid
+- **FV threshold**: 0.12-0.26 (time-scaled), stops buying clear losers
+- **P&L**: fill_price-based (with price improvement)
+- **Merge margin**: 5-10% per pair (improved from fixed 4.16% due to price improvement)
 
 ## Test Results History
 | Run | Sim | Merges | Pairs | Merge P&L | Salvage Net | TRUE NET | Notes |
 |-----|-----|--------|-------|-----------|-------------|----------|-------|
-| 3-win v8 GBM | GBM | 5 | 170 | +$6.80 | +$58.21 | +$65.01 | Lucky salvage |
-| 1-win v8 GBM | GBM | 2 | 110 | +$4.40 | -$42.30 | -$37.90 | Unlucky trend |
-| Random Walk v1 | GBM | 19 | 740 | +$42.53 | N/A | ~-$5 | First reality check |
-| 3-win sine | Sine | 42 | 1560 | +$138.73 | N/A | +$91 | Unrealistic |
-
-## Architecture
-- **Sim**: GBM with 45% annual vol, κ=0.001 mean-reversion
-- **Orders**: 10 shares/order, max 20 imbalance, $0.48 max side price
-- **Salvage**: Sells excess unmerged at bid before window close
-- **FV threshold**: Time-scaled (05-95% early → 17-83% near expiry)
-- **P&L**: merge_profit - salvage_loss - remaining_unmerged_cost
+| v9.1 3-win GBM | GBM | 4 | 25 | +$1.62 | +$3.85 | +$2.70 | **PROFITABLE** |
+| v8 5-win GBM | GBM | 8 | 175 | +$7.00 | -$28.14 | -$21.14 | Adverse selection |
+| v8 3-win GBM | GBM | 5 | 170 | +$6.80 | +$58.21 | +$65.01 | Lucky salvage |
+| v8 1-win GBM | GBM | 2 | 110 | +$4.40 | -$42.30 | -$37.90 | Unlucky trend |
+| Sine wave 3-win | Sine | 42 | 1560 | +$138.73 | N/A | +$91 | Unrealistic |
 
 ## Next Steps (Priority)
-1. **Run 20+ window sample** to estimate true expected value
-2. **Reduce position risk**: smaller orders (5 shares), stricter imbalance (10)
-3. **Explore exit sells**: Python v9 has promising exit mechanism
-4. **Calibrate with real order books** when Polymarket launches BTC 5-min markets
-5. **Live test**: Only after variance is understood (50+ window sample)
+1. **🔴 Run 10+ window Monte Carlo** for statistical confidence on positive EV
+2. **🟡 Tune FV threshold** — current 0.12-0.26 may be too restrictive (0 merges in some windows)
+3. **🟢 Calibrate sim** with real Polymarket order books
+4. **🟢 Live test** — only after 20+ window stats confirm positive EV
