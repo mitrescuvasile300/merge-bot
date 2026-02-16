@@ -468,6 +468,9 @@ impl MergeStrategy {
         let (up_pos, down_pos) = self.merge_engine.positions().await;
         let open_orders = self.order_manager.open_order_count().await;
 
+        // Get pending (unfilled) orders per side — critical for imbalance calculation
+        let (up_pending, down_pending) = self.order_manager.pending_shares_per_side().await;
+
         // Dynamic order sizing: reduce order size as window progresses.
         // Full size in first 3 minutes, half size in last 2 minutes.
         // This naturally reduces exposure accumulation near close.
@@ -478,44 +481,55 @@ impl MergeStrategy {
             self.config.shares_per_order
         };
 
+        // CRITICAL FIX: Include BOTH filled positions AND pending orders in imbalance.
+        // Without this, 6 UP orders can be placed while UP=0, then all fill at once
+        // creating UP=30 vs DOWN=0. Now we count pending orders as virtual positions.
+        let effective_up = up_pos.shares + up_pending;
+        let effective_down = down_pos.shares + down_pending;
+
         // Position balance: don't let one side get too far ahead.
         // If we have 2x more of one side, stop buying it until the other catches up.
         // This prevents massive unmerged positions at window close.
-        let max_imbalance_ratio = dec!(2.0); // Tightened from 3.0
-        let up_heavy = up_pos.shares > down_pos.shares * max_imbalance_ratio
-            && up_pos.shares > self.config.shares_per_order * dec!(2);
-        let down_heavy = down_pos.shares > up_pos.shares * max_imbalance_ratio
-            && down_pos.shares > self.config.shares_per_order * dec!(2);
+        let max_imbalance_ratio = dec!(2.0);
+        let up_heavy = effective_up > effective_down * max_imbalance_ratio
+            && effective_up > self.config.shares_per_order * dec!(2);
+        let down_heavy = effective_down > effective_up * max_imbalance_ratio
+            && effective_down > self.config.shares_per_order * dec!(2);
 
         if up_heavy {
-            debug!("Position imbalance: {} Up >> {} Down, pausing Up buys", up_pos.shares, down_pos.shares);
+            debug!("Position imbalance: {} Up ({}+{} pending) >> {} Down, pausing Up buys",
+                effective_up, up_pos.shares, up_pending, effective_down);
         }
         if down_heavy {
-            debug!("Position imbalance: {} Down >> {} Up, pausing Down buys", down_pos.shares, up_pos.shares);
+            debug!("Position imbalance: {} Down ({}+{} pending) >> {} Up, pausing Down buys",
+                effective_down, down_pos.shares, down_pending, effective_up);
         }
 
         // Calculate target buy prices based on merge profitability
         // We want: up_price + down_price < 1.0 - target_edge
         let target_combined = Decimal::ONE - self.config.target_edge;
 
-        // Position imbalance check: don't let one side get too far ahead
-        let up_excess = up_pos.shares - down_pos.shares;
-        let down_excess = down_pos.shares - up_pos.shares;
+        // Position imbalance check: include pending orders (virtual position)
+        // This prevents placing orders that would create a massive one-sided fill
+        let up_excess = effective_up - effective_down;
+        let down_excess = effective_down - effective_up;
         let up_blocked = up_excess >= self.config.max_side_imbalance;
         let down_blocked = down_excess >= self.config.max_side_imbalance;
 
         if up_blocked {
             debug!(
-                up = %up_pos.shares, down = %down_pos.shares,
+                up_filled = %up_pos.shares, up_pending = %up_pending,
+                down_filled = %down_pos.shares, down_pending = %down_pending,
                 max_imbalance = %self.config.max_side_imbalance,
-                "Skipping UP orders — position imbalance limit reached"
+                "Skipping UP orders — position+pending imbalance limit reached"
             );
         }
         if down_blocked {
             debug!(
-                up = %up_pos.shares, down = %down_pos.shares,
+                up_filled = %up_pos.shares, up_pending = %up_pending,
+                down_filled = %down_pos.shares, down_pending = %down_pending,
                 max_imbalance = %self.config.max_side_imbalance,
-                "Skipping DOWN orders — position imbalance limit reached"
+                "Skipping DOWN orders — position+pending imbalance limit reached"
             );
         }
 

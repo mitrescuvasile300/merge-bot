@@ -32,7 +32,7 @@ pub struct CliArgs {
     pub target_edge: f64,
 
     /// Shares per order
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, default_value_t = 5)]
     pub shares_per_order: u64,
 
     /// Output JSON logs
@@ -135,13 +135,13 @@ impl Config {
             order_interval: Duration::from_secs(2), // Every 2 seconds
             max_side_price: dec!(0.48),  // v7: Lowered from 0.65 to ensure combined < $0.97
             min_side_price: dec!(0.01),  // Polymarket minimum tick (not used as bid floor anymore)
-            max_side_imbalance: dec!(20), // Max 20 shares ahead of the other side (tightened from 60)
+            max_side_imbalance: dec!(10), // Max 10 shares ahead (halved from 20 to reduce variance)
 
             // Risk
             daily_stop_loss_pct: dec!(0.15),
             consecutive_loss_limit: 5,
             max_open_orders: 20,
-            max_exposure_per_market: dec!(100.0), // Max $100 per market window (~46% of capital)
+            max_exposure_per_market: dec!(50.0), // Max $50 per market window (~23% of capital, halved for variance reduction)
 
             // API Credentials
             polymarket_api_key: std::env::var("POLYMARKET_API_KEY").ok(),

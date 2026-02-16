@@ -228,6 +228,26 @@ impl OrderManager {
             .count()
     }
 
+    /// Get pending (unfilled) shares per side — used for imbalance checks
+    /// Returns (up_pending_shares, down_pending_shares)
+    pub async fn pending_shares_per_side(&self) -> (Decimal, Decimal) {
+        let orders = self.orders.read().await;
+        let mut up_pending = Decimal::ZERO;
+        let mut down_pending = Decimal::ZERO;
+
+        for order in orders.values() {
+            if order.status == OrderStatus::Open || order.status == OrderStatus::PartialFill {
+                let remaining = order.size - order.filled;
+                match order.side {
+                    Side::Up => up_pending += remaining,
+                    Side::Down => down_pending += remaining,
+                }
+            }
+        }
+
+        (up_pending, down_pending)
+    }
+
     /// Get all orders as a snapshot
     pub async fn all_orders(&self) -> Vec<Order> {
         self.orders.read().await.values().cloned().collect()
