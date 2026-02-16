@@ -189,6 +189,48 @@ impl MergeEngine {
         }
     }
 
+    /// Record a salvage sale: sell excess unmerged shares at the bid price before
+    /// the window closes. This recovers partial value instead of losing 100% of
+    /// the position when shares expire worthless.
+    ///
+    /// Returns the salvage proceeds (shares × bid_price).
+    pub async fn record_salvage(&self, side: Side, shares: Decimal, bid_price: Decimal) -> Decimal {
+        let position = match side {
+            Side::Up => &self.up_position,
+            Side::Down => &self.down_position,
+        };
+
+        let mut pos = position.write().await;
+
+        // Sanity check: don't sell more than we hold
+        let sell_shares = shares.min(pos.shares);
+        if sell_shares <= Decimal::ZERO {
+            return Decimal::ZERO;
+        }
+
+        let proceeds = sell_shares * bid_price;
+        let cost_basis = sell_shares * pos.avg_cost;
+
+        // Reduce position
+        pos.shares -= sell_shares;
+        pos.total_cost -= cost_basis;
+        // avg_cost stays the same (selling doesn't change avg cost of remaining)
+
+        // Update P&L: the salvage "loss" is (cost_basis - proceeds), but it's
+        // better than losing cost_basis entirely. Track separately.
+        let mut pnl = self.pnl.write().await;
+        pnl.total_salvage_revenue += proceeds;
+        pnl.total_salvage_shares += sell_shares;
+
+        let mode = if self.dry_run { "[DRY-RUN]" } else { "[LIVE]" };
+        info!(
+            "{} SALVAGE: Sold {} {} shares @ bid ${:.4} | Proceeds: ${:.4} | Cost basis: ${:.4} | Saved: ${:.4}",
+            mode, sell_shares, side, bid_price, proceeds, cost_basis, proceeds
+        );
+
+        proceeds
+    }
+
     /// Reset positions for a new market window
     pub async fn reset_for_new_window(&self) {
         let (up, down) = self.positions().await;

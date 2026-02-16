@@ -24,6 +24,11 @@ pub struct RiskManager {
     max_exposure_per_market: Decimal,
     /// Current market window exposure
     current_market_exposure: Decimal,
+    /// Total invested this window (monotonically increasing — not reduced by merges).
+    /// This prevents capital recycling from causing unlimited position accumulation.
+    window_total_invested: Decimal,
+    /// Max total investment per window (hard cap on capital recycling)
+    max_window_investment: Decimal,
     /// Maximum open orders
     max_open_orders: usize,
     /// Whether trading is halted
@@ -41,6 +46,9 @@ impl RiskManager {
         max_exposure_per_market: Decimal,
         max_open_orders: usize,
     ) -> Self {
+        // Max window investment = 1.5x max exposure. This allows some capital
+        // recycling through merges but prevents unlimited accumulation.
+        let max_window_investment = max_exposure_per_market * dec!(1.5);
         Self {
             starting_capital,
             available_capital: starting_capital,
@@ -51,6 +59,8 @@ impl RiskManager {
             daily_pnl: Decimal::ZERO,
             max_exposure_per_market,
             current_market_exposure: Decimal::ZERO,
+            window_total_invested: Decimal::ZERO,
+            max_window_investment,
             max_open_orders,
             halted: false,
             halt_reason: None,
@@ -106,11 +116,19 @@ impl RiskManager {
             ));
         }
 
-        // Check market exposure limit
+        // Check market exposure limit (instantaneous)
         if self.current_market_exposure + order_cost > self.max_exposure_per_market {
             return Err(format!(
                 "Market exposure ${:.2} + ${:.2} would exceed limit ${:.2}",
                 self.current_market_exposure, order_cost, self.max_exposure_per_market
+            ));
+        }
+
+        // Check total window investment (cumulative — prevents capital recycling)
+        if self.window_total_invested + order_cost > self.max_window_investment {
+            return Err(format!(
+                "Window total investment ${:.2} + ${:.2} would exceed limit ${:.2}",
+                self.window_total_invested, order_cost, self.max_window_investment
             ));
         }
 
@@ -129,6 +147,7 @@ impl RiskManager {
     pub fn record_order(&mut self, cost: Decimal) {
         self.available_capital -= cost;
         self.current_market_exposure += cost;
+        self.window_total_invested += cost; // Cumulative — never decreased
     }
 
     /// Record a merge result. Releases exposure for the merged cost.
@@ -173,6 +192,19 @@ impl RiskManager {
         }
     }
 
+    /// Record revenue from salvaging unmerged positions.
+    /// This returns capital from selling shares that would otherwise expire worthless.
+    pub fn record_salvage_revenue(&mut self, proceeds: Decimal) {
+        self.available_capital += proceeds;
+        let release = proceeds.min(self.current_market_exposure);
+        self.current_market_exposure -= release;
+        info!(
+            salvage_proceeds = %proceeds,
+            remaining_exposure = %self.current_market_exposure,
+            "Salvage revenue recorded"
+        );
+    }
+
     /// Release exposure for cancelled orders that never filled
     pub fn release_cancelled_exposure(&mut self, cost: Decimal) {
         let release = cost.min(self.current_market_exposure);
@@ -183,6 +215,7 @@ impl RiskManager {
     /// Reset for a new market window
     pub fn reset_market_exposure(&mut self) {
         self.current_market_exposure = Decimal::ZERO;
+        self.window_total_invested = Decimal::ZERO;
     }
 
     /// Halt trading
@@ -220,10 +253,12 @@ impl RiskManager {
     /// Get a summary string
     pub fn summary(&self) -> String {
         format!(
-            "Capital: ${:.2} | Daily P&L: ${:.2} | Market Exp: ${:.2} | Consec Losses: {} | Halted: {}",
+            "Capital: ${:.2} | Daily P&L: ${:.2} | Market Exp: ${:.2} | Window Invested: ${:.2}/{:.2} | Consec Losses: {} | Halted: {}",
             self.available_capital,
             self.daily_pnl,
             self.current_market_exposure,
+            self.window_total_invested,
+            self.max_window_investment,
             self.consecutive_losses,
             self.halted
         )

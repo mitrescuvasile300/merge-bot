@@ -193,6 +193,10 @@ pub struct PnlSnapshot {
     pub total_orders: u64,
     pub markets_traded: u64,
     pub win_rate: Decimal,
+    /// Revenue from selling excess unmerged shares before window close
+    pub total_salvage_revenue: Decimal,
+    /// Number of shares sold in salvage operations
+    pub total_salvage_shares: Decimal,
 }
 
 /// BTC price tick from a feed

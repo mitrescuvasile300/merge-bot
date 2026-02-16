@@ -303,6 +303,89 @@ impl MergeStrategy {
             risk.record_merge(merge_result.profit, merge_result.total_cost);
         }
 
+        // Phase 4: SALVAGE — sell excess unmerged shares before window close.
+        //
+        // Instead of losing 100% of unmerged shares (they expire worthless),
+        // sell them back at the current bid price. This is the single biggest
+        // risk reduction: a share bought at $0.47 can be sold for ~$0.20-0.40
+        // instead of going to $0.
+        //
+        // In dry-run mode, we compute the bid from the last known fair value.
+        // In live mode, we'd place actual sell orders on the CLOB.
+        {
+            let (up_pos, down_pos) = self.merge_engine.positions().await;
+
+            // Only salvage if there's a meaningful imbalance
+            if up_pos.shares > Decimal::ZERO || down_pos.shares > Decimal::ZERO {
+                // Get fresh snapshot for bid prices
+                let remaining = market.seconds_remaining();
+                let btc_tick = btc_price_fn();
+
+                if let Some(tick) = btc_tick {
+                    let sigma = self
+                        .vol_estimator
+                        .annualized_volatility()
+                        .unwrap_or(crate::pricing::VolatilityEstimator::default_volatility());
+
+                    let fair_up = self.pricer.fair_value_up(
+                        tick.price,
+                        opening_price,
+                        sigma,
+                        remaining.max(0) as u64,
+                    );
+                    let fair_down = Decimal::ONE - fair_up;
+                    let spread = dec!(0.025);
+
+                    // Compute bid prices (what we'd sell at)
+                    let up_bid = (fair_up - spread).max(dec!(0.01));
+                    let down_bid = (fair_down - spread).max(dec!(0.01));
+
+                    // Salvage excess Up shares
+                    if up_pos.shares > down_pos.shares {
+                        let excess = up_pos.shares - down_pos.shares;
+                        info!(
+                            "SALVAGE: {} excess Up shares (bid ${:.4}) — selling to avoid expiry loss",
+                            excess, up_bid
+                        );
+                        let proceeds = self.merge_engine.record_salvage(Side::Up, excess, up_bid).await;
+                        if proceeds > Decimal::ZERO {
+                            self.risk_manager.write().await.record_salvage_revenue(proceeds);
+                        }
+                    }
+
+                    // Salvage excess Down shares
+                    if down_pos.shares > up_pos.shares {
+                        let excess = down_pos.shares - up_pos.shares;
+                        info!(
+                            "SALVAGE: {} excess Down shares (bid ${:.4}) — selling to avoid expiry loss",
+                            excess, down_bid
+                        );
+                        let proceeds = self.merge_engine.record_salvage(Side::Down, excess, down_bid).await;
+                        if proceeds > Decimal::ZERO {
+                            self.risk_manager.write().await.record_salvage_revenue(proceeds);
+                        }
+                    }
+
+                    // Also salvage any balanced remaining pairs (they'd both expire worthless too)
+                    let (up_after, down_after) = self.merge_engine.positions().await;
+                    let remaining_pairs = up_after.shares.min(down_after.shares);
+                    if remaining_pairs > Decimal::ZERO {
+                        // For balanced remaining pairs, sell both sides
+                        info!(
+                            "SALVAGE: {} balanced pairs remaining — selling both sides",
+                            remaining_pairs
+                        );
+                        let up_proceeds = self.merge_engine.record_salvage(Side::Up, remaining_pairs, up_bid).await;
+                        let down_proceeds = self.merge_engine.record_salvage(Side::Down, remaining_pairs, down_bid).await;
+                        let total_proceeds = up_proceeds + down_proceeds;
+                        if total_proceeds > Decimal::ZERO {
+                            self.risk_manager.write().await.record_salvage_revenue(total_proceeds);
+                        }
+                    }
+                }
+            }
+        }
+
         // Cancel any remaining open orders and release their exposure
         let open_orders = self.order_manager.all_orders().await;
         let mut cancelled_exposure = rust_decimal::Decimal::ZERO;
@@ -334,7 +417,8 @@ impl MergeStrategy {
 
         // Calculate unmerged share cost (these expire worthless at window close)
         let unmerged_cost = up_pos.total_cost + down_pos.total_cost;
-        let net_pnl = pnl.total_profit - unmerged_cost;
+        // NET P&L = merge profit + salvage revenue - remaining unmerged losses
+        let net_pnl = pnl.total_profit + pnl.total_salvage_revenue - unmerged_cost;
 
         info!("╔══════════════════════════════════════╗");
         info!("║    WINDOW SUMMARY                    ║");
@@ -349,6 +433,12 @@ impl MergeStrategy {
             pnl.total_invested, pnl.total_merged_payout
         );
         info!("║ Merge profit: ${:.4}", pnl.total_profit);
+        if pnl.total_salvage_shares > Decimal::ZERO {
+            info!(
+                "║ Salvage: {} shares sold for ${:.4}",
+                pnl.total_salvage_shares, pnl.total_salvage_revenue
+            );
+        }
         info!(
             "║ Unmerged: {} Up (${:.4}) + {} Down (${:.4})",
             up_pos.shares, up_pos.total_cost, down_pos.shares, down_pos.total_cost

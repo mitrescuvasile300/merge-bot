@@ -135,7 +135,7 @@ impl Config {
             order_interval: Duration::from_secs(2), // Every 2 seconds
             max_side_price: dec!(0.48),  // v7: Lowered from 0.65 to ensure combined < $0.97
             min_side_price: dec!(0.01),  // Polymarket minimum tick (not used as bid floor anymore)
-            max_side_imbalance: dec!(30), // Max 30 shares ahead of the other side (tightened from 60)
+            max_side_imbalance: dec!(20), // Max 20 shares ahead of the other side (tightened from 60)
 
             // Risk
             daily_stop_loss_pct: dec!(0.15),
