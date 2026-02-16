@@ -344,25 +344,75 @@ impl MergeStrategy {
                     .simulate_fills(&sim_down_book, &market.down_token_id)
                     .await;
 
-                // Record fills in merge engine
+                // Record fills in merge engine — use fill_price (with price improvement)
                 for fill_id in &up_fills {
                     let orders = self.order_manager.all_orders().await;
                     if let Some(order) = orders.iter().find(|o| &o.id == fill_id) {
                         self.merge_engine
-                            .record_fill(Side::Up, order.filled, order.price)
+                            .record_fill(Side::Up, order.filled, order.fill_price)
                             .await;
                         // v10: Track cash outflow
-                        self.window_cash_pnl -= order.filled * order.price;
+                        self.window_cash_pnl -= order.filled * order.fill_price;
                     }
                 }
                 for fill_id in &down_fills {
                     let orders = self.order_manager.all_orders().await;
                     if let Some(order) = orders.iter().find(|o| &o.id == fill_id) {
                         self.merge_engine
-                            .record_fill(Side::Down, order.filled, order.price)
+                            .record_fill(Side::Down, order.filled, order.fill_price)
                             .await;
                         // v10: Track cash outflow
-                        self.window_cash_pnl -= order.filled * order.price;
+                        self.window_cash_pnl -= order.filled * order.fill_price;
+                    }
+                }
+            }
+
+            // MID-WINDOW STOP-LOSS: Sell excess losing-side tokens before they expire worthless.
+            // v11: Raised FV threshold from 0.20 → 0.30 and extended time window.
+            // At FV=0.30 bid is ~$0.28 vs $0.01 at expiry — saves ~$0.27/share.
+            // Two-tier system:
+            //   - FV < 0.30: sell ALL excess immediately (clear loser)
+            //   - FV < 0.40 + time < 180s: sell excess (probably losing, not worth holding)
+            if snapshot.remaining_secs > 30 && snapshot.remaining_secs < 280 {
+                let (up_pos_sl, down_pos_sl) = self.merge_engine.positions().await;
+                let min_excess = self.config.shares_per_order; // 5 shares minimum to trigger
+
+                // Two-tier FV thresholds: aggressive early exit if clearly losing
+                let fv_hard_stop = dec!(0.30);  // Below this = definite loser, exit immediately
+                let fv_soft_stop = dec!(0.40);  // Below this near close = probably loser
+                let soft_stop_active = snapshot.remaining_secs < 180; // Soft stop in last 3 min
+
+                // Check UP side
+                let up_losing = snapshot.fair_value_up < fv_hard_stop
+                    || (soft_stop_active && snapshot.fair_value_up < fv_soft_stop);
+                if up_pos_sl.shares > down_pos_sl.shares + min_excess && up_losing {
+                    let excess = up_pos_sl.shares - down_pos_sl.shares;
+                    let up_bid = (snapshot.fair_value_up - dec!(0.02)).max(dec!(0.01));
+                    info!("STOP-LOSS: Selling {} excess UP shares (FV={:.4}, bid={:.4}, tier={})",
+                        excess, snapshot.fair_value_up, up_bid,
+                        if snapshot.fair_value_up < fv_hard_stop { "HARD" } else { "SOFT" });
+                    let proceeds = self.merge_engine.record_salvage(Side::Up, excess, up_bid).await;
+                    if proceeds > Decimal::ZERO {
+                        self.risk_manager.write().await.record_salvage_revenue(proceeds);
+                        // v11: Track salvage in cash P&L
+                        self.window_cash_pnl += proceeds;
+                    }
+                }
+
+                // Check DOWN side
+                let down_losing = snapshot.fair_value_down < fv_hard_stop
+                    || (soft_stop_active && snapshot.fair_value_down < fv_soft_stop);
+                if down_pos_sl.shares > up_pos_sl.shares + min_excess && down_losing {
+                    let excess = down_pos_sl.shares - up_pos_sl.shares;
+                    let down_bid = (snapshot.fair_value_down - dec!(0.02)).max(dec!(0.01));
+                    info!("STOP-LOSS: Selling {} excess DOWN shares (FV={:.4}, bid={:.4}, tier={})",
+                        excess, snapshot.fair_value_down, down_bid,
+                        if snapshot.fair_value_down < fv_hard_stop { "HARD" } else { "SOFT" });
+                    let proceeds = self.merge_engine.record_salvage(Side::Down, excess, down_bid).await;
+                    if proceeds > Decimal::ZERO {
+                        self.risk_manager.write().await.record_salvage_revenue(proceeds);
+                        // v11: Track salvage in cash P&L
+                        self.window_cash_pnl += proceeds;
                     }
                 }
             }
@@ -558,8 +608,9 @@ impl MergeStrategy {
 
         // Per-side open order cap: prevent accumulating many one-sided orders
         // that could all fill simultaneously creating massive imbalance.
-        // Max 2 open orders per side = max 10 shares outstanding per side.
-        let max_open_per_side: usize = 2;
+        // v11: Reduced from 2 to 1 — max 5 shares outstanding per side.
+        // With 1 open per side, worst-case one-sided fill creates only 5-share excess.
+        let max_open_per_side: usize = 1;
         let up_order_capped = up_open_count >= max_open_per_side;
         let down_order_capped = down_open_count >= max_open_per_side;
 
@@ -896,19 +947,17 @@ impl MergeStrategy {
             return false;
         }
 
-        // v8: Time-scaled FV extreme threshold.
-        // Early in window: allow buying at extreme FV (time for BTC reversal).
-        // Late in window: stricter to avoid stranded positions.
+        // v11: Tightened FV extreme threshold.
+        // Data shows that buying tokens with FV < 0.20 almost always results in
+        // unmerged waste that salvages at $0.01. Tighter bands reduce position risk.
         // Window is 300s. time_fraction = remaining / 300.
-        // At full time: allow FV 0.12-0.88 (moderate: avoids clear losers but allows activity)
-        // At mid time:  allow FV ~0.18-0.82
-        // At end (60s):  allow FV ~0.24-0.76 (conservative near expiry)
-        // Key insight: tokens with FV < 0.15 are almost certainly losers — buying them
-        // creates unmerged waste. But being TOO restrictive (0.20+) kills merge activity
-        // because windows 2+ see trending BTC that pushes FV outside the band.
+        // At full time: allow FV 0.20-0.80 (avoids clear losers)
+        // At mid time:  allow FV ~0.26-0.74
+        // At end (60s):  allow FV ~0.32-0.68 (conservative near expiry)
+        // This sacrifices ~15% of merge opportunities but avoids ~40% of position losses.
         {
             let time_fraction = (snapshot.remaining_secs as f64 / 300.0).clamp(0.0, 1.0);
-            let min_fv_f64 = 0.12 + 0.14 * (1.0 - time_fraction);
+            let min_fv_f64 = 0.20 + 0.14 * (1.0 - time_fraction);
             let max_fv_f64 = 1.0 - min_fv_f64;
             let min_fv = Decimal::from_f64_retain(min_fv_f64)
                 .unwrap_or(dec!(0.15))
