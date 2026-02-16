@@ -157,6 +157,65 @@ impl OrderManager {
         Ok(cancelled)
     }
 
+    /// Cancel stale orders that are unlikely to fill.
+    ///
+    /// An order is "stale" if it's been open for > `max_age_secs` seconds AND
+    /// the current best ask for its token is > `min_gap` above our bid price.
+    /// This prevents phantom imbalance from unfillable orders blocking new ones.
+    ///
+    /// Returns (cancelled_count, cancelled_exposure)
+    pub async fn cancel_stale_orders(
+        &self,
+        max_age_secs: u64,
+        up_best_ask: Option<Decimal>,
+        down_best_ask: Option<Decimal>,
+        min_gap: Decimal,
+    ) -> (u32, Decimal) {
+        let now = chrono::Utc::now();
+        let mut orders = self.orders.write().await;
+        let mut cancelled = 0u32;
+        let mut released_exposure = Decimal::ZERO;
+
+        for order in orders.values_mut() {
+            if order.status != OrderStatus::Open && order.status != OrderStatus::PartialFill {
+                continue;
+            }
+
+            let age = (now - order.created_at).num_seconds() as u64;
+            if age < max_age_secs {
+                continue;
+            }
+
+            // Check if the current ask is far enough above our bid
+            let current_ask = match order.side {
+                Side::Up => up_best_ask,
+                Side::Down => down_best_ask,
+            };
+
+            let should_cancel = match current_ask {
+                Some(ask) => ask > order.price + min_gap,
+                None => true, // No ask available → cancel
+            };
+
+            if should_cancel {
+                let unfilled = order.size - order.filled;
+                released_exposure += unfilled * order.price;
+                order.status = OrderStatus::Cancelled;
+                cancelled += 1;
+                debug!(
+                    order_id = %order.id,
+                    side = %order.side,
+                    age_secs = age,
+                    bid = %order.price,
+                    current_ask = ?current_ask,
+                    "Cancelled stale order (unlikely to fill)"
+                );
+            }
+        }
+
+        (cancelled, released_exposure)
+    }
+
     /// Simulate order fills against the current order book.
     /// In dry-run mode, this checks if our limit orders would have been filled.
     pub async fn simulate_fills(&self, book: &OrderBook, token_id: &str) -> Vec<String> {
@@ -246,6 +305,25 @@ impl OrderManager {
         }
 
         (up_pending, down_pending)
+    }
+
+    /// Get count of open orders per side — used for per-side order caps
+    /// Returns (up_open_count, down_open_count)
+    pub async fn open_orders_per_side(&self) -> (usize, usize) {
+        let orders = self.orders.read().await;
+        let mut up_count = 0usize;
+        let mut down_count = 0usize;
+
+        for order in orders.values() {
+            if order.status == OrderStatus::Open || order.status == OrderStatus::PartialFill {
+                match order.side {
+                    Side::Up => up_count += 1,
+                    Side::Down => down_count += 1,
+                }
+            }
+        }
+
+        (up_count, down_count)
     }
 
     /// Get all orders as a snapshot

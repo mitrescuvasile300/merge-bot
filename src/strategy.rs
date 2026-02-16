@@ -31,7 +31,16 @@ pub struct MergeStrategy {
     order_manager: Arc<OrderManager>,
     merge_engine: Arc<MergeEngine>,
     risk_manager: Arc<RwLock<RiskManager>>,
+    /// v10: Tick counter for post-merge cooldown
+    last_merge_tick: u64,
+    /// v10: Current tick counter (incremented each loop iteration)
+    current_tick: u64,
+    /// v10: Running window P&L for MTM loss cap (cash flows only)
+    window_cash_pnl: Decimal,
 }
+
+/// v10 constants
+const POST_MERGE_COOLDOWN_TICKS: u64 = 2;
 
 /// Snapshot of the current market state for decision making
 #[derive(Debug)]
@@ -62,6 +71,9 @@ impl MergeStrategy {
             order_manager,
             merge_engine,
             risk_manager,
+            last_merge_tick: 0,
+            current_tick: 0,
+            window_cash_pnl: Decimal::ZERO,
         }
     }
 
@@ -113,6 +125,11 @@ impl MergeStrategy {
         // Reset merge engine for new window
         self.merge_engine.reset_for_new_window().await;
         self.risk_manager.write().await.reset_market_exposure();
+
+        // v10: Reset per-window tracking
+        self.current_tick = 0;
+        self.last_merge_tick = 0;
+        self.window_cash_pnl = Decimal::ZERO;
 
         let mut total_orders = 0u64;
 
@@ -207,14 +224,51 @@ impl MergeStrategy {
                 "Market snapshot"
             );
 
+            // v10: Increment tick counter
+            self.current_tick += 1;
+
             // Check risk limits
             if self.risk_manager.read().await.is_halted() {
                 warn!("Risk manager halted trading");
                 break;
             }
 
-            // Try to place orders on each side
-            let placed = self.evaluate_and_place_orders(market, &snapshot).await?;
+            // v10: Post-merge cooldown — skip order placement for N ticks after a merge
+            if self.current_tick.saturating_sub(self.last_merge_tick) < POST_MERGE_COOLDOWN_TICKS
+                && self.last_merge_tick > 0
+            {
+                debug!(
+                    "Post-merge cooldown: {} ticks since last merge",
+                    self.current_tick - self.last_merge_tick
+                );
+                // Still process fills/merges below, just skip new orders
+            }
+
+            // v10: MTM loss cap — stop new orders if mark-to-market P&L is too negative
+            let mtm_pnl = {
+                let (up_pos, down_pos) = self.merge_engine.positions().await;
+                let up_mtm = up_pos.shares * snapshot.fair_value_up;
+                let down_mtm = down_pos.shares * snapshot.fair_value_down;
+                self.window_cash_pnl + up_mtm + down_mtm
+            };
+            let mtm_blocked = mtm_pnl < dec!(-5);
+            if mtm_blocked {
+                debug!(
+                    mtm_pnl = %mtm_pnl,
+                    cash_pnl = %self.window_cash_pnl,
+                    "Window MTM loss cap reached — no new orders"
+                );
+            }
+
+            let cooldown_active = self.last_merge_tick > 0
+                && self.current_tick.saturating_sub(self.last_merge_tick) < POST_MERGE_COOLDOWN_TICKS;
+
+            // Try to place orders on each side (unless blocked by cooldown or MTM cap)
+            let placed = if !cooldown_active && !mtm_blocked {
+                self.evaluate_and_place_orders(market, &snapshot).await?
+            } else {
+                0
+            };
             if placed > 0 {
                 total_orders += placed;
                 info!(
@@ -231,6 +285,25 @@ impl MergeStrategy {
                     snapshot.fair_value_up,
                     snapshot.fair_value_down,
                 );
+            }
+
+            // Cancel stale orders that are unlikely to fill.
+            // This prevents phantom imbalance from sitting unfilled orders blocking new ones.
+            // An order is stale if it's been open > 30s and its bid is > 3c below current ask.
+            {
+                let (cancelled, released_exp) = self.order_manager.cancel_stale_orders(
+                    30, // max age: 30 seconds
+                    snapshot.up_best_ask,
+                    snapshot.down_best_ask,
+                    dec!(0.03), // min gap: 3c between our bid and current ask
+                ).await;
+                if cancelled > 0 {
+                    self.risk_manager.write().await.release_cancelled_exposure(released_exp);
+                    info!(
+                        "Cancelled {} stale orders (released ${:.2} exposure)",
+                        cancelled, released_exp
+                    );
+                }
             }
 
             // In dry-run mode, simulate fills using strategy-consistent fair values
@@ -278,6 +351,8 @@ impl MergeStrategy {
                         self.merge_engine
                             .record_fill(Side::Up, order.filled, order.price)
                             .await;
+                        // v10: Track cash outflow
+                        self.window_cash_pnl -= order.filled * order.price;
                     }
                 }
                 for fill_id in &down_fills {
@@ -286,6 +361,8 @@ impl MergeStrategy {
                         self.merge_engine
                             .record_fill(Side::Down, order.filled, order.price)
                             .await;
+                        // v10: Track cash outflow
+                        self.window_cash_pnl -= order.filled * order.price;
                     }
                 }
             }
@@ -294,6 +371,13 @@ impl MergeStrategy {
             if let Some(merge_result) = self.merge_engine.try_merge().await {
                 let mut risk = self.risk_manager.write().await;
                 risk.record_merge(merge_result.profit, merge_result.total_cost);
+                // v10: Track merge for cooldown + P&L
+                self.last_merge_tick = self.current_tick;
+                self.window_cash_pnl += merge_result.total_cost + merge_result.profit;
+                info!(
+                    "v10: Merge at tick {} — cooldown active for {} ticks",
+                    self.current_tick, POST_MERGE_COOLDOWN_TICKS
+                );
             }
         }
 
@@ -470,6 +554,14 @@ impl MergeStrategy {
 
         // Get pending (unfilled) orders per side — critical for imbalance calculation
         let (up_pending, down_pending) = self.order_manager.pending_shares_per_side().await;
+        let (up_open_count, down_open_count) = self.order_manager.open_orders_per_side().await;
+
+        // Per-side open order cap: prevent accumulating many one-sided orders
+        // that could all fill simultaneously creating massive imbalance.
+        // Max 2 open orders per side = max 10 shares outstanding per side.
+        let max_open_per_side: usize = 2;
+        let up_order_capped = up_open_count >= max_open_per_side;
+        let down_order_capped = down_open_count >= max_open_per_side;
 
         // Dynamic order sizing: reduce order size as window progresses.
         // Full size in first 3 minutes, half size in last 2 minutes.
@@ -513,10 +605,22 @@ impl MergeStrategy {
         // This prevents placing orders that would create a massive one-sided fill
         let up_excess = effective_up - effective_down;
         let down_excess = effective_down - effective_up;
-        let up_blocked = up_excess >= self.config.max_side_imbalance;
-        let down_blocked = down_excess >= self.config.max_side_imbalance;
+        let up_blocked = up_excess >= self.config.max_side_imbalance || up_order_capped;
+        let down_blocked = down_excess >= self.config.max_side_imbalance || down_order_capped;
 
-        if up_blocked {
+        if up_order_capped {
+            debug!(
+                up_open = up_open_count, max = max_open_per_side,
+                "UP blocked — per-side open order cap reached"
+            );
+        }
+        if down_order_capped {
+            debug!(
+                down_open = down_open_count, max = max_open_per_side,
+                "DOWN blocked — per-side open order cap reached"
+            );
+        }
+        if up_excess >= self.config.max_side_imbalance {
             debug!(
                 up_filled = %up_pos.shares, up_pending = %up_pending,
                 down_filled = %down_pos.shares, down_pending = %down_pending,
@@ -524,7 +628,7 @@ impl MergeStrategy {
                 "Skipping UP orders — position+pending imbalance limit reached"
             );
         }
-        if down_blocked {
+        if down_excess >= self.config.max_side_imbalance {
             debug!(
                 up_filled = %up_pos.shares, up_pending = %up_pending,
                 down_filled = %down_pos.shares, down_pending = %down_pending,
@@ -725,20 +829,20 @@ impl MergeStrategy {
             return false;
         }
 
-        // Fair value check: don't bid more than 2c above Black-Scholes fair value.
-        // This prevents overpaying for tokens. The bid is already capped at fair_value
-        // in calculate_bid_price, but the ask-cap in evaluate_and_place may have lowered it
-        // further, so this check should almost always pass.
+        // Fair value check: don't bid more than 3c above Black-Scholes fair value.
+        // This prevents overpaying for tokens. We use 3c (matching the spread in
+        // calculate_bid_price) so that ask-capped bids aren't rejected by a tighter
+        // tolerance. The real protection is max_side_price ($0.48).
         let fair_value = match side {
             Side::Up => snapshot.fair_value_up,
             Side::Down => snapshot.fair_value_down,
         };
-        if our_bid > fair_value + dec!(0.02) {
+        if our_bid > fair_value + dec!(0.03) {
             debug!(
                 side = %side,
                 bid = %our_bid,
                 fv = %fair_value,
-                "Skipping: bid {:.3} > fv {:.3} + 0.02",
+                "Skipping: bid {:.3} > fv {:.3} + 0.03",
                 our_bid, fair_value,
             );
             return false;
@@ -748,12 +852,14 @@ impl MergeStrategy {
         // Early in window: allow buying at extreme FV (time for BTC reversal).
         // Late in window: stricter to avoid stranded positions.
         // Window is 300s. time_fraction = remaining / 300.
-        // At full time: allow FV 0.05-0.95 (aggressive, time for reversal)
-        // At mid time:  allow FV ~0.10-0.90
-        // At end (60s):  allow FV ~0.17-0.83 (conservative)
+        // At full time: allow FV 0.20-0.80 (tightened from 0.05-0.95 to reduce adverse selection)
+        // At mid time:  allow FV ~0.25-0.75
+        // At end (60s):  allow FV ~0.30-0.70 (conservative)
+        // Key insight: tokens with FV < 0.25 are likely losers — buying them creates
+        // unmerged waste that expires worthless. Better to skip and wait for reversal.
         {
             let time_fraction = (snapshot.remaining_secs as f64 / 300.0).clamp(0.0, 1.0);
-            let min_fv_f64 = 0.05 + 0.15 * (1.0 - time_fraction);
+            let min_fv_f64 = 0.20 + 0.12 * (1.0 - time_fraction);
             let max_fv_f64 = 1.0 - min_fv_f64;
             let min_fv = Decimal::from_f64_retain(min_fv_f64)
                 .unwrap_or(dec!(0.15))
