@@ -32,7 +32,7 @@ pub struct CliArgs {
     pub target_edge: f64,
 
     /// Shares per order
-    #[arg(long, default_value_t = 20)]
+    #[arg(long, default_value_t = 10)]
     pub shares_per_order: u64,
 
     /// Output JSON logs
@@ -133,9 +133,9 @@ impl Config {
             entry_delay_secs: args.entry_delay,
             exit_buffer_secs: args.exit_buffer,
             order_interval: Duration::from_secs(2), // Every 2 seconds
-            max_side_price: dec!(0.65),  // Never pay more than 65c for one side
+            max_side_price: dec!(0.48),  // v7: Lowered from 0.65 to ensure combined < $0.97
             min_side_price: dec!(0.01),  // Polymarket minimum tick (not used as bid floor anymore)
-            max_side_imbalance: dec!(60), // Max 60 shares ahead of the other side
+            max_side_imbalance: dec!(30), // Max 30 shares ahead of the other side (tightened from 60)
 
             // Risk
             daily_stop_loss_pct: dec!(0.15),

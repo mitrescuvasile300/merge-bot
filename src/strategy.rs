@@ -374,10 +374,20 @@ impl MergeStrategy {
         let (up_pos, down_pos) = self.merge_engine.positions().await;
         let open_orders = self.order_manager.open_order_count().await;
 
+        // Dynamic order sizing: reduce order size as window progresses.
+        // Full size in first 3 minutes, half size in last 2 minutes.
+        // This naturally reduces exposure accumulation near close.
+        let effective_shares = if snapshot.remaining_secs < 120 {
+            // Last 2 min: half size (but at least min_order_shares)
+            (self.config.shares_per_order / dec!(2)).max(self.config.min_order_shares)
+        } else {
+            self.config.shares_per_order
+        };
+
         // Position balance: don't let one side get too far ahead.
-        // If we have 3x more of one side, stop buying it until the other catches up.
+        // If we have 2x more of one side, stop buying it until the other catches up.
         // This prevents massive unmerged positions at window close.
-        let max_imbalance_ratio = dec!(3.0);
+        let max_imbalance_ratio = dec!(2.0); // Tightened from 3.0
         let up_heavy = up_pos.shares > down_pos.shares * max_imbalance_ratio
             && up_pos.shares > self.config.shares_per_order * dec!(2);
         let down_heavy = down_pos.shares > up_pos.shares * max_imbalance_ratio
@@ -447,7 +457,7 @@ impl MergeStrategy {
             );
 
             if !up_heavy && self.should_buy(Side::Up, our_up_bid, up_ask, snapshot) {
-                let order_cost = self.config.shares_per_order * our_up_bid;
+                let order_cost = effective_shares * our_up_bid;
                 // Check risk THEN drop the read guard before potentially writing
                 let can_place = {
                     let risk = self.risk_manager.read().await;
@@ -463,7 +473,7 @@ impl MergeStrategy {
                                 &market.up_token_id,
                                 Side::Up,
                                 our_up_bid,
-                                self.config.shares_per_order,
+                                effective_shares,
                             )
                             .await
                         {
@@ -511,7 +521,7 @@ impl MergeStrategy {
             );
 
             if !down_heavy && self.should_buy(Side::Down, our_down_bid, down_ask, snapshot) {
-                let order_cost = self.config.shares_per_order * our_down_bid;
+                let order_cost = effective_shares * our_down_bid;
                 let can_place = {
                     let risk = self.risk_manager.read().await;
                     risk.can_place_order(order_cost, open_orders + placed as usize)
@@ -526,7 +536,7 @@ impl MergeStrategy {
                                 &market.down_token_id,
                                 Side::Down,
                                 our_down_bid,
-                                self.config.shares_per_order,
+                                effective_shares,
                             )
                             .await
                         {
@@ -561,26 +571,22 @@ impl MergeStrategy {
             Side::Down => snapshot.fair_value_down,
         };
 
-        // If we already have the other side, use our actual avg cost
-        let other_cost = if other_side_pos.shares > Decimal::ZERO {
-            other_side_pos.avg_cost
+        // v7 TWO-PHASE BUYING:
+        // Phase 1 (no other position): Use max_side_price as the cap.
+        //   We plan to buy the other side later when BTC reverses.
+        //   Old logic used fv_other.max(0.40) which set max_bid = 0.32
+        //   → 5c below ask → 0% fills. This was the #1 bug.
+        // Phase 2 (have other position): Combined check with real avg_cost.
+        let max_bid = if other_side_pos.shares > Decimal::ZERO {
+            // Phase 2: constrained by existing position cost
+            target_combined - other_side_pos.avg_cost
         } else {
-            // Estimate from fair value of the other side, but use a conservative
-            // floor of 0.40. When BTC swings, the other side's fair value can be
-            // very low (e.g. 0.15), making us bid too high on this side. By assuming
-            // the other side will cost at least 0.40, we keep combined cost < $1.
-            let fv_other = match side {
-                Side::Up => snapshot.fair_value_down,
-                Side::Down => snapshot.fair_value_up,
-            };
-            fv_other.max(dec!(0.40))
+            // Phase 1: just use the per-side cap
+            self.config.max_side_price
         };
 
-        // Our max bid = target_combined - other_side_cost
-        let max_bid = target_combined - other_cost;
-
-        // Don't bid above fair value (we want edge, not overpay)
-        let bid = max_bid.min(fair_value);
+        // Bid up to fair_value + 0.03 (merge edge covers individual-side overpay)
+        let bid = max_bid.min(fair_value + dec!(0.03));
 
         // Clamp: minimum 1c (Polymarket floor), max per config
         // NOTE: We intentionally use 0.01 as floor, NOT min_side_price.
@@ -630,10 +636,10 @@ impl MergeStrategy {
             return false;
         }
 
-        // CRITICAL FIX: Don't buy at extreme fair values (> 0.80 or < 0.20).
-        // When one side is at an extreme, the combined cost of Up + Down > $1.00,
-        // making merges unprofitable. Only buy when prices are balanced.
-        if fair_value > dec!(0.80) || fair_value < dec!(0.20) {
+        // v7: Softer FV filter (0.15/0.85, was 0.20/0.80).
+        // With realistic σ (~0.45), 0.20/0.80 blocked too many opportunities.
+        // The two-phase buying + max_side_price cap handles profitability.
+        if fair_value > dec!(0.85) || fair_value < dec!(0.15) {
             debug!(
                 side = %side,
                 fv = %fair_value,
@@ -642,16 +648,52 @@ impl MergeStrategy {
             return false;
         }
 
-        // CRITICAL FIX: Don't buy in the last 30 seconds of the window.
-        // Near expiry, fair values go to extremes (0.99 or 0.01) making
-        // any purchase likely to be on the wrong side of a binary outcome.
-        if snapshot.remaining_secs < 30 {
+        // TIME-WEIGHTED WIND-DOWN: Graduated exit as window approaches close.
+        // This is the primary defense against unmerged position risk.
+        //
+        // Phase 1 (remaining < 60s): HARD STOP — no new orders at all.
+        //   Near expiry, fair values go to extremes making any purchase risky.
+        // Phase 2 (remaining < 90s): Only buy if we're balancing an imbalance.
+        //   We can still buy the lighter side to create merge opportunities.
+        // Phase 3 (remaining < 120s): Only buy if token is a true bargain
+        //   (2c+ below fair value). This naturally reduces volume.
+        if snapshot.remaining_secs < 60 {
             debug!(
                 side = %side,
                 remaining = snapshot.remaining_secs,
-                "Skipping: too close to expiry (< 30s)",
+                "WIND-DOWN: hard stop — no new orders (< 60s)",
             );
             return false;
+        }
+
+        if snapshot.remaining_secs < 90 {
+            // Phase 2: Only allow balancing buys.
+            // Proxy: only buy if this side's fair value < 0.45 (the "cheap" underdog side).
+            // When BTC trends, one side's FV goes high (>0.55) and the other low (<0.45).
+            // Buying only the cheap side helps balance positions for more merges.
+            if fair_value >= dec!(0.45) {
+                debug!(
+                    side = %side,
+                    remaining = snapshot.remaining_secs,
+                    fv = %fair_value,
+                    "WIND-DOWN: only balancing buys allowed (< 90s), fv too high",
+                );
+                return false;
+            }
+        }
+
+        if snapshot.remaining_secs < 120 {
+            // Phase 3: Only buy true bargains (2c below fair value)
+            if our_bid >= fair_value - dec!(0.02) {
+                debug!(
+                    side = %side,
+                    remaining = snapshot.remaining_secs,
+                    bid = %our_bid,
+                    fv = %fair_value,
+                    "WIND-DOWN: only bargains allowed (< 120s), bid not cheap enough",
+                );
+                return false;
+            }
         }
 
         // Directional preference: buy each side when it's the "cheap" side.
