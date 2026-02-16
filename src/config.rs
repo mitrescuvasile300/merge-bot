@@ -50,6 +50,12 @@ pub struct CliArgs {
     /// Exit buffer in seconds (stop trading this many secs before window close)
     #[arg(long, default_value_t = 30)]
     pub exit_buffer: u64,
+
+    /// Simulation speed multiplier for fast Monte Carlo testing (dry-run only).
+    /// E.g., --sim-speed 10 runs 10x faster (each window takes ~30s instead of 300s).
+    /// GBM vol is scaled to preserve statistical properties per window.
+    #[arg(long, default_value_t = 1)]
+    pub sim_speed: u64,
 }
 
 /// Full bot configuration derived from CLI args + env vars
@@ -105,6 +111,11 @@ pub struct Config {
     pub max_windows: u64,
     pub json_logs: bool,
 
+    // === Simulation speed ===
+    pub sim_speed: u64,
+    /// Effective window duration in seconds (300 / sim_speed)
+    pub window_secs: u64,
+
     // === Per-window file logging ===
     pub log_dir: Option<String>,
 }
@@ -116,6 +127,9 @@ impl Config {
 
         // Load env vars for live mode credentials
         let _ = dotenvy::dotenv();
+
+        let sim_speed = args.sim_speed.max(1);
+        let window_secs = 300 / sim_speed;
 
         Config {
             dry_run,
@@ -130,9 +144,9 @@ impl Config {
                 .unwrap_or(dec!(0.03)),
             shares_per_order: Decimal::from(args.shares_per_order),
             min_order_shares: dec!(5),
-            entry_delay_secs: args.entry_delay,
-            exit_buffer_secs: args.exit_buffer,
-            order_interval: Duration::from_secs(2), // Every 2 seconds
+            entry_delay_secs: args.entry_delay / sim_speed,
+            exit_buffer_secs: (args.exit_buffer / sim_speed).max(1),
+            order_interval: Duration::from_millis((2000 / sim_speed).max(200)), // Scale but min 200ms
             max_side_price: dec!(0.48),  // v7: Lowered from 0.65 to ensure combined < $0.97
             min_side_price: dec!(0.01),  // Polymarket minimum tick (not used as bid floor anymore)
             max_side_imbalance: dec!(10), // Max 10 shares ahead (halved from 20 to reduce variance)
@@ -158,6 +172,10 @@ impl Config {
             // Limits
             max_windows: args.max_windows,
             json_logs: args.json_logs,
+
+            // Simulation speed
+            sim_speed,
+            window_secs,
 
             // Per-window file logging
             log_dir: if args.log_dir.is_empty() {
