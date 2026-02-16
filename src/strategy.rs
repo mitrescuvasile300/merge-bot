@@ -668,7 +668,32 @@ impl MergeStrategy {
                 "Bid calculation"
             );
 
-            if !up_heavy && self.should_buy(Side::Up, our_up_bid, up_ask, snapshot) {
+            // v11: Other-side affordability check.
+            // If we already have Up tokens but no Down, check if Down's current
+            // ask would allow a profitable merge. If combined > $1.02, don't buy more Up.
+            let up_affordable = if up_pos.shares > Decimal::ZERO && down_pos.shares.is_zero() {
+                if let Some(down_ask_price) = snapshot.down_best_ask {
+                    let projected = our_up_bid + down_ask_price;
+                    if projected > dec!(1.02) {
+                        debug!(
+                            side = "UP",
+                            our_bid = %our_up_bid,
+                            down_ask = %down_ask_price,
+                            projected = %projected,
+                            "Skipping: other side unaffordable for merge"
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                } else {
+                    true // No Down order book data → allow
+                }
+            } else {
+                true // No one-sided risk → allow
+            };
+
+            if !up_heavy && up_affordable && self.should_buy(Side::Up, our_up_bid, up_ask, snapshot) {
                 let order_cost = effective_shares * our_up_bid;
                 // Check risk THEN drop the read guard before potentially writing
                 let can_place = {
@@ -732,7 +757,30 @@ impl MergeStrategy {
                 "Bid calculation"
             );
 
-            if !down_heavy && self.should_buy(Side::Down, our_down_bid, down_ask, snapshot) {
+            // v11: Other-side affordability check for Down side.
+            let down_affordable = if down_pos.shares > Decimal::ZERO && up_pos.shares.is_zero() {
+                if let Some(up_ask_price) = snapshot.up_best_ask {
+                    let projected = our_down_bid + up_ask_price;
+                    if projected > dec!(1.02) {
+                        debug!(
+                            side = "DOWN",
+                            our_bid = %our_down_bid,
+                            up_ask = %up_ask_price,
+                            projected = %projected,
+                            "Skipping: other side unaffordable for merge"
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                } else {
+                    true
+                }
+            } else {
+                true
+            };
+
+            if !down_heavy && down_affordable && self.should_buy(Side::Down, our_down_bid, down_ask, snapshot) {
                 let order_cost = effective_shares * our_down_bid;
                 let can_place = {
                     let risk = self.risk_manager.read().await;
